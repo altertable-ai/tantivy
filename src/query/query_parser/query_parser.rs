@@ -2127,4 +2127,21 @@ mod test {
             "Unsupported query: Regex queries are not allowed."
         );
     }
+
+    #[test]
+    fn vector_field_rejected_by_query_parser() {
+        use crate::schema::VectorOptions;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_vector_field("vec", VectorOptions::new(4));
+        let schema = schema_builder.build();
+        let tokenizer_manager = TokenizerManager::default();
+        let qp = QueryParser::new(schema, vec![], tokenizer_manager);
+        let err = qp.parse_query("vec:hello").unwrap_err();
+        assert_matches!(err, QueryParserError::UnsupportedQuery(_));
+        assert_eq!(
+            err.to_string(),
+            "Unsupported query: Vector fields are searched with KnnQuery, not the query parser"
+        );
+    }
 }

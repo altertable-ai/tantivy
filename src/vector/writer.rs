@@ -41,7 +41,11 @@ impl VectorFieldsWriter {
         Self { per_field }
     }
 
-    pub(crate) fn add_document<D: Document>(&mut self, doc: &D, doc_id: DocId) -> crate::Result<()> {
+    pub(crate) fn add_document<D: Document>(
+        &mut self,
+        doc: &D,
+        doc_id: DocId,
+    ) -> crate::Result<()> {
         for (field, value) in doc.iter_fields_and_values() {
             if let Some(writer) = self
                 .per_field

@@ -70,7 +70,8 @@ impl From<io::Error> for DeserializeError {
 pub trait DocumentDeserialize: Sized {
     /// Attempts to deserialize Self from a given document deserializer.
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: DocumentDeserializer<'de>;
+    where
+        D: DocumentDeserializer<'de>;
 }
 
 /// A deserializer that can walk through each entry in the document.
@@ -91,7 +92,8 @@ pub trait DocumentDeserializer<'de> {
 pub trait ValueDeserialize: Sized {
     /// Attempts to deserialize Self from a given value deserializer.
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de>;
+    where
+        D: ValueDeserializer<'de>;
 }
 
 /// A value deserializer.
@@ -131,7 +133,8 @@ pub trait ValueDeserializer<'de> {
 
     /// Attempts to deserialize the value using a given visitor.
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
-    where V: ValueVisitor;
+    where
+        V: ValueVisitor;
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -257,14 +260,18 @@ pub trait ValueVisitor {
     #[inline]
     /// Called when the deserializer visits an array.
     fn visit_array<'de, A>(&self, _access: A) -> Result<Self::Value, DeserializeError>
-    where A: ArrayAccess<'de> {
+    where
+        A: ArrayAccess<'de>,
+    {
         Err(DeserializeError::UnsupportedType(ValueType::Array))
     }
 
     #[inline]
     /// Called when the deserializer visits a object value.
     fn visit_object<'de, A>(&self, _access: A) -> Result<Self::Value, DeserializeError>
-    where A: ObjectAccess<'de> {
+    where
+        A: ObjectAccess<'de>,
+    {
         Err(DeserializeError::UnsupportedType(ValueType::Object))
     }
 }
@@ -308,7 +315,8 @@ pub struct BinaryDocumentDeserializer<'de, R> {
 }
 
 impl<'de, R> BinaryDocumentDeserializer<'de, R>
-where R: Read
+where
+    R: Read,
 {
     /// Attempts to create a new document deserializer from a given reader.
     pub(crate) fn from_reader(
@@ -333,7 +341,8 @@ where R: Read
 }
 
 impl<'de, R> DocumentDeserializer<'de> for BinaryDocumentDeserializer<'de, R>
-where R: Read
+where
+    R: Read,
 {
     #[inline]
     fn size_hint(&self) -> usize {
@@ -365,7 +374,8 @@ pub struct BinaryValueDeserializer<'de, R> {
 }
 
 impl<'de, R> BinaryValueDeserializer<'de, R>
-where R: Read
+where
+    R: Read,
 {
     /// Attempts to create a new value deserializer from a given reader.
     fn from_reader(
@@ -433,7 +443,8 @@ where R: Read
 }
 
 impl<'de, R> ValueDeserializer<'de> for BinaryValueDeserializer<'de, R>
-where R: Read
+where
+    R: Read,
 {
     fn deserialize_null(self) -> Result<(), DeserializeError> {
         self.validate_type(ValueType::Null)?;
@@ -505,7 +516,9 @@ where R: Read
     }
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
-    where V: ValueVisitor {
+    where
+        V: ValueVisitor,
+    {
         match self.value_type {
             ValueType::Null => visitor.visit_null(),
             ValueType::String => {
@@ -604,7 +617,8 @@ pub struct BinaryArrayDeserializer<'de, R> {
 }
 
 impl<'de, R> BinaryArrayDeserializer<'de, R>
-where R: Read
+where
+    R: Read,
 {
     /// Attempts to create a new array deserializer from a given reader.
     fn from_reader(
@@ -629,7 +643,8 @@ where R: Read
 }
 
 impl<'de, R> ArrayAccess<'de> for BinaryArrayDeserializer<'de, R>
-where R: Read
+where
+    R: Read,
 {
     #[inline]
     fn size_hint(&self) -> usize {
@@ -662,7 +677,8 @@ pub struct BinaryObjectDeserializer<'de, R> {
 }
 
 impl<'de, R> BinaryObjectDeserializer<'de, R>
-where R: Read
+where
+    R: Read,
 {
     /// Attempts to create a new object deserializer from a given reader.
     fn from_reader(
@@ -675,7 +691,8 @@ where R: Read
 }
 
 impl<'de, R> ObjectAccess<'de> for BinaryObjectDeserializer<'de, R>
-where R: Read
+where
+    R: Read,
 {
     #[inline]
     /// A indicator as to how many values are in the object.
@@ -710,7 +727,9 @@ where R: Read
 impl ValueDeserialize for String {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_string()
     }
 }
@@ -718,7 +737,9 @@ impl ValueDeserialize for String {
 impl ValueDeserialize for u64 {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_u64()
     }
 }
@@ -726,7 +747,9 @@ impl ValueDeserialize for u64 {
 impl ValueDeserialize for i64 {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_i64()
     }
 }
@@ -734,7 +757,9 @@ impl ValueDeserialize for i64 {
 impl ValueDeserialize for f64 {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_f64()
     }
 }
@@ -742,7 +767,9 @@ impl ValueDeserialize for f64 {
 impl ValueDeserialize for DateTime {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_datetime()
     }
 }
@@ -750,7 +777,9 @@ impl ValueDeserialize for DateTime {
 impl ValueDeserialize for Ipv6Addr {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_ip_address()
     }
 }
@@ -758,7 +787,9 @@ impl ValueDeserialize for Ipv6Addr {
 impl ValueDeserialize for Facet {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_facet()
     }
 }
@@ -766,7 +797,9 @@ impl ValueDeserialize for Facet {
 impl ValueDeserialize for Vec<u8> {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_bytes()
     }
 }
@@ -774,7 +807,9 @@ impl ValueDeserialize for Vec<u8> {
 impl ValueDeserialize for PreTokenizedString {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_pre_tokenized_string()
     }
 }
@@ -787,7 +822,9 @@ impl<T: ValueDeserialize> ValueVisitor for VecVisitor<T> {
     type Value = Vec<T>;
 
     fn visit_array<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
-    where A: ArrayAccess<'de> {
+    where
+        A: ArrayAccess<'de>,
+    {
         let mut entries = Vec::with_capacity(access.size_hint());
         while let Some(value) = access.next_element()? {
             entries.push(value);
@@ -798,7 +835,9 @@ impl<T: ValueDeserialize> ValueVisitor for VecVisitor<T> {
 impl<T: ValueDeserialize> ValueDeserialize for Vec<T> {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_any(VecVisitor(PhantomData))
     }
 }
@@ -808,7 +847,9 @@ impl<T: ValueDeserialize> ValueVisitor for BTreeMapVisitor<T> {
     type Value = BTreeMap<String, T>;
 
     fn visit_object<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
-    where A: ObjectAccess<'de> {
+    where
+        A: ObjectAccess<'de>,
+    {
         let mut entries = BTreeMap::new();
         while let Some((key, value)) = access.next_entry()? {
             entries.insert(key, value);
@@ -819,7 +860,9 @@ impl<T: ValueDeserialize> ValueVisitor for BTreeMapVisitor<T> {
 impl<T: ValueDeserialize> ValueDeserialize for BTreeMap<String, T> {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_any(BTreeMapVisitor(PhantomData))
     }
 }
@@ -829,7 +872,9 @@ impl<T: ValueDeserialize> ValueVisitor for HashMapVisitor<T> {
     type Value = HashMap<String, T>;
 
     fn visit_object<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
-    where A: ObjectAccess<'de> {
+    where
+        A: ObjectAccess<'de>,
+    {
         let mut entries = HashMap::with_capacity(access.size_hint());
         while let Some((key, value)) = access.next_entry()? {
             entries.insert(key, value);
@@ -840,7 +885,9 @@ impl<T: ValueDeserialize> ValueVisitor for HashMapVisitor<T> {
 impl<T: ValueDeserialize> ValueDeserialize for HashMap<String, T> {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_any(HashMapVisitor(PhantomData))
     }
 }
@@ -850,7 +897,9 @@ impl<T: ValueDeserialize> ValueVisitor for KeyValuesVecVisitor<T> {
     type Value = Vec<(String, T)>;
 
     fn visit_object<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
-    where A: ObjectAccess<'de> {
+    where
+        A: ObjectAccess<'de>,
+    {
         let mut entries = Vec::with_capacity(access.size_hint());
         while let Some(entry) = access.next_entry()? {
             entries.push(entry);
@@ -861,7 +910,9 @@ impl<T: ValueDeserialize> ValueVisitor for KeyValuesVecVisitor<T> {
 impl<T: ValueDeserialize> ValueDeserialize for Vec<(String, T)> {
     #[inline]
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         deserializer.deserialize_any(KeyValuesVecVisitor(PhantomData))
     }
 }

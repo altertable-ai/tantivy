@@ -15,3 +15,7 @@ trace.dat
 cargo-timing*
 control
 variable
+
+# Local HF model + Python venv for benches/scripts/embed_wiki.py
+benches/hf_models/
+benches/scripts/.venv/

@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::directory::FileSlice;
 use crate::schema::Field;
 use crate::vector::hnsw::build_hnsw_in_memory;
 use crate::vector::io::{distance_to_score, read_vec_file, VectorFieldBundle};
 use crate::vector::VectorIndexInner;
-use crate::directory::FileSlice;
 use crate::{DocId, Score};
 
 /// Readers for all vector fields in a segment.

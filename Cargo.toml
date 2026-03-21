@@ -12,7 +12,14 @@ readme = "README.md"
 keywords = ["search", "information", "retrieval"]
 edition = "2021"
 rust-version = "1.86"
-exclude = ["benches/*.json", "benches/*.txt"]
+exclude = [
+    "benches/*.json",
+    "benches/*.txt",
+    "benches/hf_models",
+    "benches/scripts/.venv",
+    "benches/wiki_embedded.f32.bin",
+    "benches/wiki_embedded.meta.json",
+]
 
 [dependencies]
 oneshot = "0.1.13"
@@ -210,4 +217,8 @@ harness = false
 
 [[bench]]
 name = "regex_all_terms"
+harness = false
+
+[[bench]]
+name = "vector_wiki"
 harness = false

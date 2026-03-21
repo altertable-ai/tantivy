@@ -1,4 +1,5 @@
 use crate::collector::TopDocs;
+use crate::error::TantivyError;
 use crate::query::KnnQuery;
 use crate::schema::{Schema, VectorOptions};
 use crate::{Index, IndexWriter};
@@ -80,5 +81,29 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
         top_docs[0].1.doc_id, best_doc,
         "k-NN top doc should match brute-force nearest neighbor after merge"
     );
+    Ok(())
+}
+
+#[test]
+fn knn_query_rejects_wrong_query_dimension() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(3));
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema);
+    let mut writer: IndexWriter = index.writer(15_000_000)?;
+    writer.add_document(doc!(emb => vec![1.0f32, 0.0, 0.0]))?;
+    writer.commit()?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let query = KnnQuery::new(emb, vec![0.0f32, 1.0], 1);
+    let err = searcher
+        .search(&query, &TopDocs::with_limit(1).order_by_score())
+        .unwrap_err();
+    match err {
+        TantivyError::InvalidArgument(msg) => {
+            assert!(msg.contains("dimension"), "{msg}");
+        }
+        e => panic!("unexpected error: {e:?}"),
+    }
     Ok(())
 }

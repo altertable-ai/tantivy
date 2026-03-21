@@ -128,12 +128,15 @@ impl Weight for FastFieldRangeWeight {
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                     )
                 }
-                Type::Bool | Type::Facet | Type::Bytes | Type::Json | Type::IpAddr | Type::Vector => {
-                    Err(crate::TantivyError::InvalidArgument(format!(
-                        "unsupported value bytes type in json term value_bytes {:?}",
-                        term_value.typ()
-                    )))
-                }
+                Type::Bool
+                | Type::Facet
+                | Type::Bytes
+                | Type::Json
+                | Type::IpAddr
+                | Type::Vector => Err(crate::TantivyError::InvalidArgument(format!(
+                    "unsupported value bytes type in json term value_bytes {:?}",
+                    term_value.typ()
+                ))),
             }
         } else if field_type.is_ip_addr() {
             let parse_ip_from_bytes = |term: &Term| {

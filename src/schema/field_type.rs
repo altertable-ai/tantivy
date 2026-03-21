@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use super::ip_options::IpAddrOptions;
+use super::vector_options::VectorOptions;
 use super::IntoIpv6Addr;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::facet_options::FacetOptions;
@@ -16,7 +17,6 @@ use crate::schema::{
     DateOptions, Facet, IndexRecordOption, JsonObjectOptions, NumericOptions, OwnedValue,
     TextFieldIndexing, TextOptions,
 };
-use super::vector_options::VectorOptions;
 use crate::time::format_description::well_known::Rfc3339;
 use crate::time::OffsetDateTime;
 use crate::tokenizer::PreTokenizedString;

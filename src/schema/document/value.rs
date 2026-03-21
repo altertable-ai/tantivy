@@ -228,7 +228,9 @@ impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<
             ReferenceValueLeaf::PreTokStr(val) => {
                 ReferenceValue::Leaf(ReferenceValueLeaf::PreTokStr(val))
             }
-            ReferenceValueLeaf::Vector(val) => ReferenceValue::Leaf(ReferenceValueLeaf::Vector(val)),
+            ReferenceValueLeaf::Vector(val) => {
+                ReferenceValue::Leaf(ReferenceValueLeaf::Vector(val))
+            }
         }
     }
 }
@@ -355,7 +357,8 @@ impl<'a> ReferenceValueLeaf<'a> {
 /// A enum representing a value for tantivy to index.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceValue<'a, V>
-where V: Value<'a> + ?Sized
+where
+    V: Value<'a> + ?Sized,
 {
     /// A null value.
     Leaf(ReferenceValueLeaf<'a>),
@@ -366,7 +369,8 @@ where V: Value<'a> + ?Sized
 }
 
 impl<'a, V> ReferenceValue<'a, V>
-where V: Value<'a>
+where
+    V: Value<'a>,
 {
     #[inline]
     /// Returns if the value is `null` or not.

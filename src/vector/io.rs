@@ -2,8 +2,8 @@
 
 use std::io::{Read, Write};
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::directory::FileSlice;
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::schema::VectorOptions;
 use crate::TantivyError;
@@ -33,9 +33,8 @@ pub(crate) fn write_vec_file(
     writer.write_u32::<LittleEndian>(fields.len() as u32)?;
     for bundle in fields {
         writer.write_u32::<LittleEndian>(bundle.field_id)?;
-        let opts_json = serde_json::to_vec(&bundle.options).map_err(|e| {
-            TantivyError::InternalError(format!("vector options json: {e}"))
-        })?;
+        let opts_json = serde_json::to_vec(&bundle.options)
+            .map_err(|e| TantivyError::InternalError(format!("vector options json: {e}")))?;
         writer.write_u32::<LittleEndian>(opts_json.len() as u32)?;
         writer.write_all(&opts_json)?;
         writer.write_u64::<LittleEndian>(bundle.graph.len() as u64)?;

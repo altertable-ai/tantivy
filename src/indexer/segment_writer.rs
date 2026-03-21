@@ -5,8 +5,6 @@ use tokenizer_api::BoxTokenStream;
 
 use super::operation::AddOperation;
 use crate::fastfield::FastFieldsWriter;
-use crate::schema::FieldType;
-use crate::vector::VectorFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::indexing_term::IndexingTerm;
@@ -17,8 +15,10 @@ use crate::postings::{
     PerFieldPostingsWriter, PostingsWriter,
 };
 use crate::schema::document::{Document, Value};
+use crate::schema::FieldType;
 use crate::schema::{FieldEntry, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
+use crate::vector::VectorFieldsWriter;
 use crate::{DocId, Opstamp, TantivyError};
 
 /// Computes the initial size of the hash table.
