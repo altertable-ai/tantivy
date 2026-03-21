@@ -271,6 +271,9 @@ pub(crate) mod type_codes {
     pub const ARRAY_CODE: u8 = 12;
     pub const OBJECT_CODE: u8 = 13;
 
+    /// Dense `f32` vector (embedding). Length is encoded as `VInt`, followed by that many `f32`.
+    pub const VECTOR_CODE: u8 = 14;
+
     // Extended type codes
     pub const TOK_STR_EXT_CODE: u8 = 0;
 }

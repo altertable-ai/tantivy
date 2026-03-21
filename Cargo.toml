@@ -70,6 +70,8 @@ futures-util = { version = "0.3.28", optional = true }
 futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
 typetag = "0.2.21"
+hnsw_rs = { version = "0.3.4", optional = true }
+anndists = { version = "0.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -113,7 +115,15 @@ debug-assertions = true
 overflow-checks = true
 
 [features]
-default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer"]
+default = [
+    "mmap",
+    "stopwords",
+    "lz4-compression",
+    "columnar-zstd-compression",
+    "stemmer",
+    "vector",
+]
+vector = ["dep:hnsw_rs", "dep:anndists"]
 stemmer = ["rust-stemmers"]
 mmap = ["fs4", "tempfile", "memmap2"]
 stopwords = []

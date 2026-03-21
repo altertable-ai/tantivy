@@ -5,6 +5,8 @@ use tokenizer_api::BoxTokenStream;
 
 use super::operation::AddOperation;
 use crate::fastfield::FastFieldsWriter;
+use crate::schema::FieldType;
+use crate::vector::VectorFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::indexing_term::IndexingTerm;
@@ -15,7 +17,7 @@ use crate::postings::{
     PerFieldPostingsWriter, PostingsWriter,
 };
 use crate::schema::document::{Document, Value};
-use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
+use crate::schema::{FieldEntry, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, Opstamp, TantivyError};
 
@@ -58,6 +60,7 @@ pub struct SegmentWriter {
     per_field_text_analyzers: Vec<TextAnalyzer>,
     term_buffer: IndexingTerm,
     schema: Schema,
+    vector_fields: VectorFieldsWriter,
 }
 
 impl SegmentWriter {
@@ -114,6 +117,7 @@ impl SegmentWriter {
             doc_opstamps: Vec::with_capacity(1_000),
             per_field_text_analyzers,
             term_buffer: IndexingTerm::with_capacity(16),
+            vector_fields: VectorFieldsWriter::for_schema(&schema),
             schema,
         })
     }
@@ -130,6 +134,8 @@ impl SegmentWriter {
             self.ctx,
             self.fast_field_writers,
             &self.fieldnorms_writer,
+            self.vector_fields,
+            self.max_doc,
             self.segment_serializer,
         )?;
         Ok(self.doc_opstamps)
@@ -142,6 +148,7 @@ impl SegmentWriter {
             + self.fieldnorms_writer.mem_usage()
             + self.fast_field_writers.mem_usage()
             + self.segment_serializer.mem_usage()
+            + self.vector_fields.mem_usage()
     }
 
     fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
@@ -338,6 +345,9 @@ impl SegmentWriter {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
+                FieldType::Vector(_) => {
+                    // Vectors are indexed via the HNSW graph in `.vec`, not the inverted index.
+                }
             }
         }
         Ok(())
@@ -353,6 +363,7 @@ impl SegmentWriter {
         let AddOperation { document, opstamp } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
+        self.vector_fields.add_document(&document, self.max_doc)?;
         self.index_document(&document)?;
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&document, &self.schema)?;
@@ -392,6 +403,8 @@ fn remap_and_write(
     ctx: IndexingContext,
     fast_field_writers: FastFieldsWriter,
     fieldnorms_writer: &FieldNormsWriter,
+    vector_fields: VectorFieldsWriter,
+    max_doc: DocId,
     mut serializer: SegmentSerializer,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
@@ -411,6 +424,10 @@ fn remap_and_write(
     )?;
     debug!("fastfield-serialize");
     fast_field_writers.serialize(serializer.get_fast_field_write())?;
+
+    if let Some(vector_write) = serializer.extract_vector_write() {
+        vector_fields.serialize(vector_write, max_doc)?;
+    }
 
     debug!("serializer-close");
     serializer.close()?;

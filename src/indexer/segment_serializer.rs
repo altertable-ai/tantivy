@@ -4,6 +4,7 @@ use crate::directory::WritePtr;
 use crate::fieldnorm::FieldNormsSerializer;
 use crate::index::{Segment, SegmentComponent};
 use crate::postings::InvertedIndexSerializer;
+use crate::schema::{FieldType, Schema};
 use crate::store::StoreWriter;
 
 /// Segment serializer is in charge of laying out on disk
@@ -14,6 +15,7 @@ pub struct SegmentSerializer {
     fast_field_write: WritePtr,
     fieldnorms_serializer: Option<FieldNormsSerializer>,
     postings_serializer: InvertedIndexSerializer,
+    vector_write: Option<WritePtr>,
 }
 
 impl SegmentSerializer {
@@ -36,12 +38,19 @@ impl SegmentSerializer {
         let fieldnorms_serializer = FieldNormsSerializer::from_write(fieldnorms_write)?;
 
         let postings_serializer = InvertedIndexSerializer::open(&mut segment)?;
+        let schema = segment.schema();
+        let vector_write = if schema_has_vector_field(&schema) {
+            Some(segment.open_write(SegmentComponent::VectorIndex)?)
+        } else {
+            None
+        };
         Ok(SegmentSerializer {
             segment,
             store_writer,
             fast_field_write,
             fieldnorms_serializer: Some(fieldnorms_serializer),
             postings_serializer,
+            vector_write,
         })
     }
 
@@ -76,14 +85,28 @@ impl SegmentSerializer {
         &mut self.store_writer
     }
 
+    /// Takes the vector index writer, if this schema defines vector fields.
+    pub(crate) fn extract_vector_write(&mut self) -> Option<WritePtr> {
+        self.vector_write.take()
+    }
+
     /// Finalize the segment serialization.
     pub fn close(mut self) -> crate::Result<()> {
         if let Some(fieldnorms_serializer) = self.extract_fieldnorms_serializer() {
             fieldnorms_serializer.close()?;
         }
         self.fast_field_write.terminate()?;
+        if let Some(vw) = self.vector_write.take() {
+            vw.terminate()?;
+        }
         self.postings_serializer.close()?;
         self.store_writer.close()?;
         Ok(())
     }
+}
+
+fn schema_has_vector_field(schema: &Schema) -> bool {
+    schema
+        .fields()
+        .any(|(_, fe)| matches!(fe.field_type(), FieldType::Vector(_)))
 }

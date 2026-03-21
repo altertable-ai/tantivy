@@ -514,6 +514,9 @@ where B: AsRef<[u8]>
             Type::IpAddr => {
                 write_opt(f, self.as_ip_addr())?;
             }
+            Type::Vector => {
+                write!(f, "<vector>")?;
+            }
         }
         Ok(())
     }
