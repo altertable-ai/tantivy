@@ -10,7 +10,7 @@ pub(crate) mod writer;
 pub use reader::{VectorFieldReader, VectorFieldReaders};
 
 pub(crate) use hnsw::VectorIndexInner;
-pub(crate) use io::{write_vec_file, VectorFieldBundle};
+pub(crate) use io::{write_vec_file, BytesMaybeMmap, FlatStorage, VectorFieldBundle};
 pub(crate) use writer::{build_hnsw_from_flat, VectorFieldsWriter};
 
 #[cfg(test)]

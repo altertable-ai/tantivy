@@ -3,8 +3,11 @@
 use hnsw_rs::prelude::*;
 
 use crate::schema::{VectorDistance, VectorOptions};
-use crate::vector::io::max_layer_for_n;
 use crate::TantivyError;
+
+/// Must match `hnsw_rs::hnsw::NB_LAYER_MAX`: `Description::dump` rejects other values, and
+/// `file_dump` / reload expect this layer count.
+pub(crate) const HNSW_DUMP_MAX_LAYER: usize = 16;
 
 /// Loaded HNSW index for one distance type.
 pub(crate) enum VectorIndexInner {
@@ -28,7 +31,7 @@ pub(crate) fn build_hnsw_in_memory(
             n * dim
         )));
     }
-    let max_layer = max_layer_for_n(n);
+    let max_layer = HNSW_DUMP_MAX_LAYER;
     let max_elements = n.max(1);
     let inner = match options.distance {
         VectorDistance::Euclidean => {

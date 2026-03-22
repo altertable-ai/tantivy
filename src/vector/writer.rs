@@ -1,14 +1,16 @@
 //! Collects per-document vectors during segment indexing and serializes HNSW graphs.
 
+use std::fs;
 use std::io::Write;
 
 use common::TerminatingWrite;
+use hnsw_rs::api::AnnT;
 
 use crate::directory::WritePtr;
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::hnsw::build_hnsw_in_memory;
-use crate::vector::io::{write_vec_file, VectorFieldBundle};
+use crate::vector::hnsw::{build_hnsw_in_memory, VectorIndexInner};
+use crate::vector::io::{write_vec_file, BytesMaybeMmap, FlatStorage, VectorFieldBundle};
 use crate::{DocId, TantivyError};
 
 /// Collects dense vectors for all vector fields in a segment.
@@ -118,9 +120,9 @@ impl VectorFieldsWriter {
             bundles.push(VectorFieldBundle {
                 field_id: field_writer.field.field_id(),
                 options: field_writer.options.clone(),
-                graph,
-                data,
-                flat,
+                graph: BytesMaybeMmap::Owned(graph),
+                data: BytesMaybeMmap::Owned(data),
+                flat: FlatStorage::Owned(flat),
                 num_docs: max_doc,
             });
         }
@@ -136,11 +138,28 @@ fn build_and_dump_hnsw(
     max_doc: DocId,
     flat: &[f32],
 ) -> crate::Result<(Vec<u8>, Vec<u8>)> {
-    // Build in memory to validate vectors and HNSW parameters. The `hnsw_rs` `file_dump` format
-    // requires a fixed layer count that does not match small graphs; we persist only the flat
-    // vectors and rebuild the graph at segment load (see `VectorFieldReader::open`).
-    let _inner = build_hnsw_in_memory(options, max_doc, flat)?;
-    Ok((Vec::new(), Vec::new()))
+    if max_doc == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let inner = build_hnsw_in_memory(options, max_doc, flat)?;
+    let dir = tempfile::tempdir().map_err(|e| {
+        TantivyError::InternalError(format!("temp dir for hnsw dump: {e}"))
+    })?;
+    let basename = match &inner {
+        VectorIndexInner::L2(h) => h.file_dump(dir.path(), "tntv"),
+        VectorIndexInner::Cosine(h) => h.file_dump(dir.path(), "tntv"),
+        VectorIndexInner::Dot(h) => h.file_dump(dir.path(), "tntv"),
+    }
+    .map_err(|e| TantivyError::InternalError(format!("hnsw file_dump: {e}")))?;
+    let graph_path = dir.path().join(format!("{basename}.hnsw.graph"));
+    let data_path = dir.path().join(format!("{basename}.hnsw.data"));
+    let graph = fs::read(&graph_path).map_err(|e| {
+        TantivyError::InternalError(format!("read hnsw graph dump: {e}"))
+    })?;
+    let data = fs::read(&data_path).map_err(|e| {
+        TantivyError::InternalError(format!("read hnsw data dump: {e}"))
+    })?;
+    Ok((graph, data))
 }
 
 /// Rebuilds HNSW graph bytes after a segment merge.

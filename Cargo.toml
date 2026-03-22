@@ -130,9 +130,9 @@ default = [
     "stemmer",
     "vector",
 ]
-vector = ["dep:hnsw_rs", "dep:anndists"]
+vector = ["dep:hnsw_rs", "dep:anndists", "dep:tempfile"]
 stemmer = ["rust-stemmers"]
-mmap = ["fs4", "tempfile", "memmap2"]
+mmap = ["fs4", "dep:tempfile", "memmap2"]
 stopwords = []
 
 lz4-compression = ["lz4_flex"]

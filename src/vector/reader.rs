@@ -1,14 +1,69 @@
 //! Loads `.vec` segment data and runs k-NN queries.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
-use crate::directory::FileSlice;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::schema::Field;
 use crate::vector::hnsw::build_hnsw_in_memory;
-use crate::vector::io::{distance_to_score, read_vec_file, VectorFieldBundle};
+use crate::vector::io::{distance_to_score, read_vec_file, FlatStorage, VectorFieldBundle};
 use crate::vector::VectorIndexInner;
 use crate::{DocId, Score};
+
+/// Dense vector storage: either an owned buffer (merge / RAM) or a 4-byte-aligned view into the
+/// segment file (typically mmap-backed).
+enum VectorFlatInner {
+    Owned(Vec<f32>),
+    MmapAligned {
+        backing: Arc<OwnedBytes>,
+        range: Range<usize>,
+    },
+}
+
+impl VectorFlatInner {
+    fn from_storage(flat: FlatStorage) -> crate::Result<Self> {
+        match flat {
+            FlatStorage::Owned(v) => Ok(Self::Owned(v)),
+            FlatStorage::Mmap { backing, range } => {
+                let bytes = backing.as_slice().get(range.clone()).ok_or_else(|| {
+                    crate::TantivyError::DataCorruption(
+                        crate::error::DataCorruption::comment_only("vector flat range"),
+                    )
+                })?;
+                if bytes.len() % 4 != 0 {
+                    return Err(crate::TantivyError::DataCorruption(
+                        crate::error::DataCorruption::comment_only(
+                            "vector flat payload not multiple of 4",
+                        ),
+                    ));
+                }
+                let (prefix, f32s, suffix) = unsafe { bytes.align_to::<f32>() };
+                if prefix.is_empty() && suffix.is_empty() && f32s.len() * 4 == bytes.len() {
+                    Ok(Self::MmapAligned { backing, range })
+                } else {
+                    let v: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    Ok(Self::Owned(v))
+                }
+            }
+        }
+    }
+
+    fn as_f32_slice(&self) -> &[f32] {
+        match self {
+            Self::Owned(v) => v.as_slice(),
+            Self::MmapAligned { backing, range } => {
+                let bytes = &backing.as_slice()[range.clone()];
+                let (prefix, f32s, suffix) = unsafe { bytes.align_to::<f32>() };
+                debug_assert!(prefix.is_empty() && suffix.is_empty());
+                f32s
+            }
+        }
+    }
+}
 
 /// Readers for all vector fields in a segment.
 #[derive(Clone)]
@@ -49,18 +104,23 @@ pub struct VectorFieldReader {
     pub options: crate::schema::VectorOptions,
     /// Number of documents indexed in this segment.
     pub num_docs: u32,
-    flat: Vec<f32>,
+    flat: VectorFlatInner,
     inner: VectorIndexInner,
 }
 
 impl VectorFieldReader {
     fn open(bundle: VectorFieldBundle) -> crate::Result<Self> {
-        let inner = build_hnsw_in_memory(&bundle.options, bundle.num_docs, &bundle.flat)?;
+        let flat = VectorFlatInner::from_storage(bundle.flat)?;
+        let inner = build_hnsw_in_memory(
+            &bundle.options,
+            bundle.num_docs,
+            flat.as_f32_slice(),
+        )?;
         Ok(VectorFieldReader {
             field_id: bundle.field_id,
             options: bundle.options,
             num_docs: bundle.num_docs,
-            flat: bundle.flat,
+            flat,
             inner,
         })
     }
@@ -85,11 +145,12 @@ impl VectorFieldReader {
             return None;
         }
         let start = doc as usize * dim;
-        self.flat.get(start..start + dim)
+        let flat = self.flat.as_f32_slice();
+        flat.get(start..start + dim)
     }
 
     /// Full flat storage (row-major), for segment merge.
     pub fn flat_vectors(&self) -> &[f32] {
-        &self.flat
+        self.flat.as_f32_slice()
     }
 }
