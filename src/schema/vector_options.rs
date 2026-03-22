@@ -5,19 +5,15 @@ use serde::{Deserialize, Serialize};
 /// Distance metric for vector similarity search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum VectorDistance {
     /// Cosine distance (1 - cosine similarity), as defined in `anndists`.
+    #[default]
     Cosine,
     /// Squared L2 (Euclidean) distance.
     Euclidean,
     /// Dot product distance (for normalized vectors, related to cosine).
     DotProduct,
-}
-
-impl Default for VectorDistance {
-    fn default() -> Self {
-        VectorDistance::Cosine
-    }
 }
 
 /// Configuration for a vector field indexed with HNSW.

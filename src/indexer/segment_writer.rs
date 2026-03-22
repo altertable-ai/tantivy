@@ -397,6 +397,7 @@ impl SegmentWriter {
 /// to the `SegmentSerializer`.
 ///
 /// `doc_id_map` is used to map to the new doc_id order.
+#[allow(clippy::too_many_arguments)]
 fn remap_and_write(
     schema: Schema,
     per_field_postings_writers: &PerFieldPostingsWriter,
