@@ -1,4 +1,6 @@
-//! In-memory HNSW construction (shared by writer and reader).
+//! Build `hnsw_rs` graphs in memory for serialization (indexing / merge). Search uses
+//! [`crate::vector::mmaped_hnsw`] — always `HnswIo` reload with mmap on the data file, like other
+//! Tantivy segment components backed by mmap’d bytes.
 
 use hnsw_rs::prelude::*;
 
@@ -9,19 +11,20 @@ use crate::TantivyError;
 /// `file_dump` / reload expect this layer count.
 pub(crate) const HNSW_DUMP_MAX_LAYER: usize = 16;
 
-/// Loaded HNSW index for one distance type.
-pub(crate) enum VectorIndexInner {
+/// In-memory graph used only to call [`AnnT::file_dump`](hnsw_rs::api::AnnT::file_dump) while
+/// building a segment. Search never holds this type.
+pub(crate) enum BuiltHnsw {
     L2(Hnsw<'static, f32, DistL2>),
     Cosine(Hnsw<'static, f32, DistCosine>),
     Dot(Hnsw<'static, f32, DistDot>),
 }
 
-/// Builds HNSW in memory from row-major vectors (no disk I/O).
-pub(crate) fn build_hnsw_in_memory(
+/// Builds HNSW in memory from row-major vectors (for `file_dump` during indexing).
+pub(crate) fn build_hnsw_for_flat(
     options: &VectorOptions,
     max_doc: crate::DocId,
     flat: &[f32],
-) -> crate::Result<VectorIndexInner> {
+) -> crate::Result<BuiltHnsw> {
     let dim = options.dimension;
     let n = max_doc as usize;
     if flat.len() != n * dim {
@@ -48,7 +51,7 @@ pub(crate) fn build_hnsw_in_memory(
                 h.insert((slice, doc));
             }
             h.set_searching_mode(true);
-            VectorIndexInner::L2(h)
+            BuiltHnsw::L2(h)
         }
         VectorDistance::Cosine => {
             let mut h = Hnsw::<'_, f32, DistCosine>::new(
@@ -64,7 +67,7 @@ pub(crate) fn build_hnsw_in_memory(
                 h.insert((slice, doc));
             }
             h.set_searching_mode(true);
-            VectorIndexInner::Cosine(h)
+            BuiltHnsw::Cosine(h)
         }
         VectorDistance::DotProduct => {
             let mut h = Hnsw::<'_, f32, DistDot>::new(
@@ -80,7 +83,7 @@ pub(crate) fn build_hnsw_in_memory(
                 h.insert((slice, doc));
             }
             h.set_searching_mode(true);
-            VectorIndexInner::Dot(h)
+            BuiltHnsw::Dot(h)
         }
     };
     Ok(inner)

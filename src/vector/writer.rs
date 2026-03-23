@@ -1,17 +1,41 @@
 //! Collects per-document vectors during segment indexing and serializes HNSW graphs.
 
+#[cfg(not(feature = "mmap"))]
 use std::fs;
 use std::io::Write;
+use std::sync::Arc;
 
+#[cfg(feature = "mmap")]
+use common::StableDeref;
 use common::TerminatingWrite;
 use hnsw_rs::api::AnnT;
+#[cfg(feature = "mmap")]
+use memmap2::Mmap;
 
 use crate::directory::WritePtr;
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::hnsw::{build_hnsw_in_memory, VectorIndexInner};
-use crate::vector::io::{write_vec_file, BytesMaybeMmap, FlatStorage, VectorFieldBundle};
+use crate::vector::hnsw::{build_hnsw_for_flat, BuiltHnsw};
+use crate::vector::io::{
+    write_vec_file, BytesMaybeMmap, FlatStorage, HnswDumpKeepalive, VectorFieldBundle,
+};
 use crate::{DocId, TantivyError};
+
+/// Newtype so [`memmap2::Mmap`] can be wrapped in [`OwnedBytes`] (requires [`StableDeref`]).
+#[cfg(feature = "mmap")]
+struct StableMmap(Mmap);
+
+#[cfg(feature = "mmap")]
+impl std::ops::Deref for StableMmap {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+
+#[cfg(feature = "mmap")]
+unsafe impl StableDeref for StableMmap {}
 
 /// Collects dense vectors for all vector fields in a segment.
 pub(crate) struct VectorFieldsWriter {
@@ -116,14 +140,16 @@ impl VectorFieldsWriter {
                 };
                 flat.extend_from_slice(vec);
             }
-            let (graph, data) = build_and_dump_hnsw(&field_writer.options, max_doc, &flat)?;
+            let (graph, data, hnsw_dump_keepalive) =
+                build_and_dump_hnsw(&field_writer.options, max_doc, &flat)?;
             bundles.push(VectorFieldBundle {
                 field_id: field_writer.field.field_id(),
                 options: field_writer.options.clone(),
-                graph: BytesMaybeMmap::Owned(graph),
-                data: BytesMaybeMmap::Owned(data),
+                graph,
+                data,
                 flat: FlatStorage::Owned(flat),
                 num_docs: max_doc,
+                hnsw_dump_keepalive,
             });
         }
         write_vec_file(&mut writer, &bundles)?;
@@ -137,36 +163,75 @@ fn build_and_dump_hnsw(
     options: &VectorOptions,
     max_doc: DocId,
     flat: &[f32],
-) -> crate::Result<(Vec<u8>, Vec<u8>)> {
+) -> crate::Result<(
+    BytesMaybeMmap,
+    BytesMaybeMmap,
+    Option<Arc<HnswDumpKeepalive>>,
+)> {
     if max_doc == 0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((
+            BytesMaybeMmap::Owned(Vec::new()),
+            BytesMaybeMmap::Owned(Vec::new()),
+            None,
+        ));
     }
-    let inner = build_hnsw_in_memory(options, max_doc, flat)?;
-    let dir = tempfile::tempdir().map_err(|e| {
-        TantivyError::InternalError(format!("temp dir for hnsw dump: {e}"))
-    })?;
-    let basename = match &inner {
-        VectorIndexInner::L2(h) => h.file_dump(dir.path(), "tntv"),
-        VectorIndexInner::Cosine(h) => h.file_dump(dir.path(), "tntv"),
-        VectorIndexInner::Dot(h) => h.file_dump(dir.path(), "tntv"),
+    let built = build_hnsw_for_flat(options, max_doc, flat)?;
+    let dir = tempfile::tempdir()
+        .map_err(|e| TantivyError::InternalError(format!("temp dir for hnsw dump: {e}")))?;
+    let basename = match &built {
+        BuiltHnsw::L2(h) => h.file_dump(dir.path(), "tntv"),
+        BuiltHnsw::Cosine(h) => h.file_dump(dir.path(), "tntv"),
+        BuiltHnsw::Dot(h) => h.file_dump(dir.path(), "tntv"),
     }
     .map_err(|e| TantivyError::InternalError(format!("hnsw file_dump: {e}")))?;
     let graph_path = dir.path().join(format!("{basename}.hnsw.graph"));
     let data_path = dir.path().join(format!("{basename}.hnsw.data"));
-    let graph = fs::read(&graph_path).map_err(|e| {
-        TantivyError::InternalError(format!("read hnsw graph dump: {e}"))
-    })?;
-    let data = fs::read(&data_path).map_err(|e| {
-        TantivyError::InternalError(format!("read hnsw data dump: {e}"))
-    })?;
-    Ok((graph, data))
+
+    #[cfg(feature = "mmap")]
+    {
+        use std::fs::File;
+
+        use crate::directory::OwnedBytes;
+
+        let graph_file = File::open(&graph_path)
+            .map_err(|e| TantivyError::InternalError(format!("open hnsw graph dump: {e}")))?;
+        let data_file = File::open(&data_path)
+            .map_err(|e| TantivyError::InternalError(format!("open hnsw data dump: {e}")))?;
+        let graph_mmap = unsafe { Mmap::map(&graph_file) }
+            .map_err(|e| TantivyError::InternalError(format!("mmap hnsw graph dump: {e}")))?;
+        let data_mmap = unsafe { Mmap::map(&data_file) }
+            .map_err(|e| TantivyError::InternalError(format!("mmap hnsw data dump: {e}")))?;
+        let keepalive = Arc::new(HnswDumpKeepalive {
+            _dir: dir,
+            graph: OwnedBytes::new(StableMmap(graph_mmap)),
+            data: OwnedBytes::new(StableMmap(data_mmap)),
+        });
+        let (graph, data) = keepalive.as_bundle_slices();
+        Ok((graph, data, Some(keepalive)))
+    }
+
+    #[cfg(not(feature = "mmap"))]
+    {
+        let graph = fs::read(&graph_path)
+            .map_err(|e| TantivyError::InternalError(format!("read hnsw graph dump: {e}")))?;
+        let data = fs::read(&data_path)
+            .map_err(|e| TantivyError::InternalError(format!("read hnsw data dump: {e}")))?;
+        Ok((
+            BytesMaybeMmap::Owned(graph),
+            BytesMaybeMmap::Owned(data),
+            None,
+        ))
+    }
 }
 
-/// Rebuilds HNSW graph bytes after a segment merge.
 pub(crate) fn build_hnsw_from_flat(
     options: &VectorOptions,
     max_doc: DocId,
     flat: &[f32],
-) -> crate::Result<(Vec<u8>, Vec<u8>)> {
+) -> crate::Result<(
+    BytesMaybeMmap,
+    BytesMaybeMmap,
+    Option<Arc<HnswDumpKeepalive>>,
+)> {
     build_and_dump_hnsw(options, max_doc, flat)
 }

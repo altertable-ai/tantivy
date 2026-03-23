@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::schema::Field;
-use crate::vector::hnsw::build_hnsw_in_memory;
 use crate::vector::io::{distance_to_score, read_vec_file, FlatStorage, VectorFieldBundle};
+use crate::vector::mmaped_hnsw::open_vector_index;
 use crate::vector::VectorIndexInner;
 use crate::{DocId, Score};
 
@@ -111,8 +111,10 @@ pub struct VectorFieldReader {
 impl VectorFieldReader {
     fn open(bundle: VectorFieldBundle) -> crate::Result<Self> {
         let flat = VectorFlatInner::from_storage(bundle.flat)?;
-        let inner = build_hnsw_in_memory(
+        let inner = open_vector_index(
             &bundle.options,
+            bundle.graph.as_slice(),
+            bundle.data.as_slice(),
             bundle.num_docs,
             flat.as_f32_slice(),
         )?;
@@ -127,12 +129,8 @@ impl VectorFieldReader {
 
     /// Approximate k-nearest neighbors for `query` (same dimension as the field).
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(DocId, Score)> {
-        let neighbors = match &self.inner {
-            VectorIndexInner::L2(h) => h.search(query, k, ef),
-            VectorIndexInner::Cosine(h) => h.search(query, k, ef),
-            VectorIndexInner::Dot(h) => h.search(query, k, ef),
-        };
-        neighbors
+        self.inner
+            .search(query, k, ef)
             .into_iter()
             .map(|n| (n.d_id as DocId, distance_to_score(n.distance)))
             .collect()

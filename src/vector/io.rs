@@ -4,6 +4,9 @@ use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[cfg(feature = "mmap")]
+use tempfile::TempDir;
+
 use crate::directory::{FileSlice, OwnedBytes};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 
@@ -39,6 +42,37 @@ impl BytesMaybeMmap {
     }
 }
 
+/// Keeps the temp directory and mmap-backed [`OwnedBytes`] alive while copying HNSW bytes into
+/// `.vec` (see [`VectorFieldBundle::hnsw_dump_keepalive`]).
+#[cfg(feature = "mmap")]
+pub(crate) struct HnswDumpKeepalive {
+    pub(crate) _dir: TempDir,
+    pub(crate) graph: OwnedBytes,
+    pub(crate) data: OwnedBytes,
+}
+
+#[cfg(feature = "mmap")]
+impl HnswDumpKeepalive {
+    pub(crate) fn as_bundle_slices(self: &Arc<Self>) -> (BytesMaybeMmap, BytesMaybeMmap) {
+        let glen = self.graph.len();
+        let dlen = self.data.len();
+        (
+            BytesMaybeMmap::Slice {
+                backing: Arc::new(self.graph.clone()),
+                range: 0..glen,
+            },
+            BytesMaybeMmap::Slice {
+                backing: Arc::new(self.data.clone()),
+                range: 0..dlen,
+            },
+        )
+    }
+}
+
+/// When `mmap` is disabled, [`VectorFieldBundle::hnsw_dump_keepalive`] is always `None`.
+#[cfg(not(feature = "mmap"))]
+pub(crate) struct HnswDumpKeepalive(());
+
 /// Row-major `f32` (`num_docs * dimension`) from the writer, or a mmap view of the `.vec` file.
 pub(crate) enum FlatStorage {
     Owned(Vec<f32>),
@@ -56,6 +90,10 @@ pub(crate) struct VectorFieldBundle {
     pub data: BytesMaybeMmap,
     pub flat: FlatStorage,
     pub num_docs: u32,
+    /// Present only when graph/data were mmap'd from a temp `file_dump`; keeps the temp dir alive
+    /// until [`write_vec_file`] finishes. Always `None` when loaded via [`read_vec_file`].
+    #[allow(dead_code)] // Retained for drop order; not accessed otherwise.
+    pub(crate) hnsw_dump_keepalive: Option<Arc<HnswDumpKeepalive>>,
 }
 
 /// Writes all vector fields for a segment into `writer`.
@@ -206,6 +244,7 @@ pub(crate) fn read_vec_file(data: FileSlice) -> crate::Result<Vec<VectorFieldBun
             data,
             flat,
             num_docs,
+            hnsw_dump_keepalive: None,
         });
     }
 
