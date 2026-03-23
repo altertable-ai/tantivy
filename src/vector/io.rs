@@ -121,8 +121,22 @@ pub(crate) fn write_vec_file(
         writer.write_u32::<LittleEndian>(bundle.options.dimension as u32)?;
         match &bundle.flat {
             FlatStorage::Owned(v) => {
-                for &f in v {
-                    writer.write_f32::<LittleEndian>(f)?;
+                // `.vec` stores little-endian `f32`; on LE hosts write the buffer in one shot.
+                #[cfg(target_endian = "little")]
+                {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            v.as_ptr() as *const u8,
+                            v.len() * std::mem::size_of::<f32>(),
+                        )
+                    };
+                    writer.write_all(bytes)?;
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    for &f in v {
+                        writer.write_f32::<LittleEndian>(f)?;
+                    }
                 }
             }
             FlatStorage::Mmap { .. } => {

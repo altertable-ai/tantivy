@@ -3,6 +3,7 @@
 //! Tantivy segment components backed by mmap’d bytes.
 
 use hnsw_rs::prelude::*;
+use rayon::current_num_threads;
 
 use crate::schema::{VectorDistance, VectorOptions};
 use crate::TantivyError;
@@ -17,6 +18,24 @@ pub(crate) enum BuiltHnsw {
     L2(Hnsw<'static, f32, DistL2>),
     Cosine(Hnsw<'static, f32, DistCosine>),
     Dot(Hnsw<'static, f32, DistDot>),
+}
+
+/// Row slices and doc ids for [`Hnsw::parallel_insert_slice`].
+fn flat_rows_as_insert_slices(flat: &[f32], n: usize, dim: usize) -> Vec<(&[f32], usize)> {
+    (0..n)
+        .map(|doc| {
+            let start = doc * dim;
+            (&flat[start..start + dim], doc)
+        })
+        .collect()
+}
+
+/// Whether to use [`Hnsw::parallel_insert_slice`]: `hnsw_rs` uses Rayon and recommends batches
+/// large enough to amortize threading — typically `1000 *` the number of Rayon threads.
+fn parallel_insert_worthwhile(n: usize) -> bool {
+    const MIN_DOCS_PER_RAYON_THREAD: usize = 1000;
+    let threads = current_num_threads().max(1);
+    n >= threads.saturating_mul(MIN_DOCS_PER_RAYON_THREAD)
 }
 
 /// Builds HNSW in memory from row-major vectors (for `file_dump` during indexing).
@@ -36,6 +55,11 @@ pub(crate) fn build_hnsw_for_flat(
     }
     let max_layer = HNSW_DUMP_MAX_LAYER;
     let max_elements = n.max(1);
+    let insert_slices_opt = if n > 0 && parallel_insert_worthwhile(n) {
+        Some(flat_rows_as_insert_slices(flat, n, dim))
+    } else {
+        None
+    };
     let inner = match options.distance {
         VectorDistance::Euclidean => {
             let mut h = Hnsw::<'_, f32, DistL2>::new(
@@ -45,10 +69,15 @@ pub(crate) fn build_hnsw_for_flat(
                 options.ef_construction,
                 DistL2 {},
             );
-            for doc in 0..n {
-                let start = doc * dim;
-                let slice = &flat[start..start + dim];
-                h.insert((slice, doc));
+            if n > 0 {
+                if let Some(ref slices) = insert_slices_opt {
+                    h.parallel_insert_slice(slices);
+                } else {
+                    for doc in 0..n {
+                        let start = doc * dim;
+                        h.insert((&flat[start..start + dim], doc));
+                    }
+                }
             }
             h.set_searching_mode(true);
             BuiltHnsw::L2(h)
@@ -61,10 +90,15 @@ pub(crate) fn build_hnsw_for_flat(
                 options.ef_construction,
                 DistCosine {},
             );
-            for doc in 0..n {
-                let start = doc * dim;
-                let slice = &flat[start..start + dim];
-                h.insert((slice, doc));
+            if n > 0 {
+                if let Some(ref slices) = insert_slices_opt {
+                    h.parallel_insert_slice(slices);
+                } else {
+                    for doc in 0..n {
+                        let start = doc * dim;
+                        h.insert((&flat[start..start + dim], doc));
+                    }
+                }
             }
             h.set_searching_mode(true);
             BuiltHnsw::Cosine(h)
@@ -77,10 +111,15 @@ pub(crate) fn build_hnsw_for_flat(
                 options.ef_construction,
                 DistDot {},
             );
-            for doc in 0..n {
-                let start = doc * dim;
-                let slice = &flat[start..start + dim];
-                h.insert((slice, doc));
+            if n > 0 {
+                if let Some(ref slices) = insert_slices_opt {
+                    h.parallel_insert_slice(slices);
+                } else {
+                    for doc in 0..n {
+                        let start = doc * dim;
+                        h.insert((&flat[start..start + dim], doc));
+                    }
+                }
             }
             h.set_searching_mode(true);
             BuiltHnsw::Dot(h)
