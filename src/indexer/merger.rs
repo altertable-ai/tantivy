@@ -22,9 +22,7 @@ use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
-use crate::vector::{
-    build_hnsw_from_flat, write_vec_file, FlatStorage, VectorFieldBundle,
-};
+use crate::vector::{build_hnsw_from_flat, write_vec_file, FlatStorage, VectorFieldBundle};
 use crate::{DocAddress, DocId, InvertedIndexReader};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.

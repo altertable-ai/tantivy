@@ -197,13 +197,12 @@ pub(crate) fn read_vec_file(data: FileSlice) -> crate::Result<Vec<VectorFieldBun
                 crate::error::DataCorruption::comment_only(".vec truncated (options)"),
             ));
         }
-        let options: VectorOptions = serde_json::from_slice(&buf[pos..pos + opt_len]).map_err(
-            |e| {
+        let options: VectorOptions =
+            serde_json::from_slice(&buf[pos..pos + opt_len]).map_err(|e| {
                 TantivyError::DataCorruption(crate::error::DataCorruption::comment_only(format!(
                     "vector options: {e}"
                 )))
-            },
-        )?;
+            })?;
         pos += opt_len;
 
         let graph_len = read_u64_le(buf, &mut pos)? as usize;

@@ -27,9 +27,9 @@ impl VectorFlatInner {
             FlatStorage::Owned(v) => Ok(Self::Owned(v)),
             FlatStorage::Mmap { backing, range } => {
                 let bytes = backing.as_slice().get(range.clone()).ok_or_else(|| {
-                    crate::TantivyError::DataCorruption(
-                        crate::error::DataCorruption::comment_only("vector flat range"),
-                    )
+                    crate::TantivyError::DataCorruption(crate::error::DataCorruption::comment_only(
+                        "vector flat range",
+                    ))
                 })?;
                 if bytes.len() % 4 != 0 {
                     return Err(crate::TantivyError::DataCorruption(

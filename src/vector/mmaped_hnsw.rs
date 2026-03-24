@@ -81,12 +81,10 @@ impl MmapedHnswDot {
 }
 
 fn write_dump_files(dir: &Path, basename: &str, graph: &[u8], data: &[u8]) -> crate::Result<()> {
-    fs::write(dir.join(format!("{basename}.hnsw.graph")), graph).map_err(|e| {
-        TantivyError::InternalError(format!("write hnsw graph temp: {e}"))
-    })?;
-    fs::write(dir.join(format!("{basename}.hnsw.data")), data).map_err(|e| {
-        TantivyError::InternalError(format!("write hnsw data temp: {e}"))
-    })?;
+    fs::write(dir.join(format!("{basename}.hnsw.graph")), graph)
+        .map_err(|e| TantivyError::InternalError(format!("write hnsw graph temp: {e}")))?;
+    fs::write(dir.join(format!("{basename}.hnsw.data")), data)
+        .map_err(|e| TantivyError::InternalError(format!("write hnsw data temp: {e}")))?;
     Ok(())
 }
 
@@ -99,9 +97,9 @@ fn load_mmap_after_dump_on_disk(
     match options.distance {
         VectorDistance::Euclidean => {
             let mmaped = MmapedHnswL2::try_new(dir, io, |io: &mut HnswIo| {
-                let mut h = io.load_hnsw::<f32, DistL2>().map_err(|e| {
-                    TantivyError::InternalError(format!("hnsw load (L2): {e}"))
-                })?;
+                let mut h = io
+                    .load_hnsw::<f32, DistL2>()
+                    .map_err(|e| TantivyError::InternalError(format!("hnsw load (L2): {e}")))?;
                 h.set_searching_mode(true);
                 Ok::<_, TantivyError>(h)
             })?;
@@ -109,9 +107,9 @@ fn load_mmap_after_dump_on_disk(
         }
         VectorDistance::Cosine => {
             let mmaped = MmapedHnswCosine::try_new(dir, io, |io: &mut HnswIo| {
-                let mut h = io.load_hnsw::<f32, DistCosine>().map_err(|e| {
-                    TantivyError::InternalError(format!("hnsw load (Cosine): {e}"))
-                })?;
+                let mut h = io
+                    .load_hnsw::<f32, DistCosine>()
+                    .map_err(|e| TantivyError::InternalError(format!("hnsw load (Cosine): {e}")))?;
                 h.set_searching_mode(true);
                 Ok::<_, TantivyError>(h)
             })?;
@@ -119,9 +117,9 @@ fn load_mmap_after_dump_on_disk(
         }
         VectorDistance::DotProduct => {
             let mmaped = MmapedHnswDot::try_new(dir, io, |io: &mut HnswIo| {
-                let mut h = io.load_hnsw::<f32, DistDot>().map_err(|e| {
-                    TantivyError::InternalError(format!("hnsw load (Dot): {e}"))
-                })?;
+                let mut h = io
+                    .load_hnsw::<f32, DistDot>()
+                    .map_err(|e| TantivyError::InternalError(format!("hnsw load (Dot): {e}")))?;
                 h.set_searching_mode(true);
                 Ok::<_, TantivyError>(h)
             })?;
@@ -154,9 +152,8 @@ pub(crate) fn open_vector_index(
         ));
     }
     let built = build_hnsw_for_flat(options, max_doc, flat)?;
-    let dir = tempfile::tempdir().map_err(|e| {
-        TantivyError::InternalError(format!("temp dir for hnsw rebuild dump: {e}"))
-    })?;
+    let dir = tempfile::tempdir()
+        .map_err(|e| TantivyError::InternalError(format!("temp dir for hnsw rebuild dump: {e}")))?;
     let basename = match &built {
         BuiltHnsw::L2(h) => h.file_dump(dir.path(), "tntv"),
         BuiltHnsw::Cosine(h) => h.file_dump(dir.path(), "tntv"),
