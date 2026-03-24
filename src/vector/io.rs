@@ -4,12 +4,11 @@ use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
 
+use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 #[cfg(feature = "mmap")]
 use tempfile::TempDir;
 
 use crate::directory::{FileSlice, OwnedBytes};
-use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
-
 use crate::schema::VectorOptions;
 use crate::TantivyError;
 
@@ -172,8 +171,8 @@ fn read_u64_le(buf: &[u8], pos: &mut usize) -> crate::Result<u64> {
 }
 
 /// Reads the `.vec` file into bundles. The returned [`FlatStorage::Mmap`] views borrow the
-/// underlying [`OwnedBytes`] (typically mmap-backed when using [`crate::directory::MmapDirectory`]),
-/// so vector rows are not copied out of the segment file.
+/// underlying [`OwnedBytes`] (typically mmap-backed when using
+/// [`crate::directory::MmapDirectory`]), so vector rows are not copied out of the segment file.
 pub(crate) fn read_vec_file(data: FileSlice) -> crate::Result<Vec<VectorFieldBundle>> {
     let backing = Arc::new(data.read_bytes()?);
     let buf = backing.as_slice();

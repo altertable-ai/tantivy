@@ -4,11 +4,9 @@ use std::sync::Arc;
 use columnar::{
     ColumnType, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder,
 };
-use common::ReadOnlyBitSet;
+use common::{ReadOnlyBitSet, TerminatingWrite};
 use itertools::Itertools;
 use measure_time::debug_time;
-
-use common::TerminatingWrite;
 
 use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};

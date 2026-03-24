@@ -15,8 +15,7 @@ use crate::postings::{
     PerFieldPostingsWriter, PostingsWriter,
 };
 use crate::schema::document::{Document, Value};
-use crate::schema::FieldType;
-use crate::schema::{FieldEntry, Schema, DATE_TIME_PRECISION_INDEXED};
+use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::vector::VectorFieldsWriter;
 use crate::{DocId, Opstamp, TantivyError};

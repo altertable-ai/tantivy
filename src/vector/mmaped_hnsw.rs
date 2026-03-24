@@ -45,7 +45,8 @@ pub(crate) struct MmapedHnswDot {
     inner: Hnsw<'this, f32, DistDot>,
 }
 
-/// Search index: mmap-backed reload from an `hnsw_rs` dump on disk (temp dir under the segment reader).
+/// Search index: mmap-backed reload from an `hnsw_rs` dump on disk (temp dir under the segment
+/// reader).
 pub(crate) enum VectorIndexInner {
     L2(MmapedHnswL2),
     Cosine(MmapedHnswCosine),

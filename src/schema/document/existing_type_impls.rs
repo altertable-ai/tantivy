@@ -214,9 +214,7 @@ impl<'a> Value<'a> for &'a PreTokenizedString {
 
 impl ValueDeserialize for serde_json::Value {
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where
-        D: ValueDeserializer<'de>,
-    {
+    where D: ValueDeserializer<'de> {
         struct SerdeValueVisitor;
 
         impl ValueVisitor for SerdeValueVisitor {
@@ -252,9 +250,7 @@ impl ValueDeserialize for serde_json::Value {
             }
 
             fn visit_array<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
-            where
-                A: ArrayAccess<'de>,
-            {
+            where A: ArrayAccess<'de> {
                 let mut elements = Vec::with_capacity(access.size_hint());
 
                 while let Some(value) = access.next_element()? {
@@ -265,9 +261,7 @@ impl ValueDeserialize for serde_json::Value {
             }
 
             fn visit_object<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
-            where
-                A: ObjectAccess<'de>,
-            {
+            where A: ObjectAccess<'de> {
                 let mut object = serde_json::Map::with_capacity(access.size_hint());
 
                 while let Some((key, value)) = access.next_entry()? {
@@ -311,9 +305,7 @@ impl Document for BTreeMap<Field, crate::schema::OwnedValue> {
 }
 impl DocumentDeserialize for BTreeMap<Field, crate::schema::OwnedValue> {
     fn deserialize<'de, D>(mut deserializer: D) -> Result<Self, DeserializeError>
-    where
-        D: DocumentDeserializer<'de>,
-    {
+    where D: DocumentDeserializer<'de> {
         let mut document = BTreeMap::new();
 
         while let Some((field, value)) = deserializer.next_field()? {
@@ -339,9 +331,7 @@ impl Document for HashMap<Field, crate::schema::OwnedValue> {
 }
 impl DocumentDeserialize for HashMap<Field, crate::schema::OwnedValue> {
     fn deserialize<'de, D>(mut deserializer: D) -> Result<Self, DeserializeError>
-    where
-        D: DocumentDeserializer<'de>,
-    {
+    where D: DocumentDeserializer<'de> {
         let mut document = HashMap::with_capacity(deserializer.size_hint());
 
         while let Some((field, value)) = deserializer.next_field()? {
