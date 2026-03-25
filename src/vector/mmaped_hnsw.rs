@@ -1,165 +1,151 @@
-//! Vector search index: always [`HnswIo::load_hnsw`] with [`ReloadOptions::new(true)`] so the
-//! `hnsw_rs` data file is mmap’d — the same “segment bytes → mmap” model as the rest of Tantivy.
+//! HNSW search directly on the compact graph + flat vectors.
 //!
-//! When the `.vec` bundle has no graph/data (legacy), we build in memory, `file_dump` into a temp
-//! directory, then load through this path so behavior stays one code path.
-#![allow(dead_code)] // `io` is only referenced via ouroboros `inner` borrows
+//! Replaces the previous approach of dumping to temp files and reloading through
+//! `hnsw_rs::hnswio::HnswIo`.  The search algorithm is the standard HNSW greedy
+//! descent + beam search from the original paper (Malkov & Yashunin, 2016).
 
-use std::fs;
-use std::path::Path;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
-use hnsw_rs::api::AnnT;
-use hnsw_rs::hnswio::{HnswIo, ReloadOptions};
-use hnsw_rs::prelude::*;
-use ouroboros::self_referencing;
-use tempfile::TempDir;
+use crate::schema::VectorDistance;
+use crate::vector::io::{distance_fn_for, CompactHnswGraph};
 
-use crate::schema::{VectorDistance, VectorOptions};
-use crate::vector::hnsw::{build_hnsw_for_flat, BuiltHnsw};
-use crate::TantivyError;
-
-#[self_referencing]
-pub(crate) struct MmapedHnswL2 {
-    dump_dir: TempDir,
-    io: HnswIo,
-    #[borrows(mut io)]
-    #[not_covariant]
-    inner: Hnsw<'this, f32, DistL2>,
+/// Wrapper returned by [`search`] — same fields as the old `hnsw_rs::prelude::Neighbour`
+/// so the reader can convert to `(DocId, Score)` unchanged.
+pub(crate) struct SearchResult {
+    pub doc_id: u32,
+    pub distance: f32,
 }
 
-#[self_referencing]
-pub(crate) struct MmapedHnswCosine {
-    dump_dir: TempDir,
-    io: HnswIo,
-    #[borrows(mut io)]
-    #[not_covariant]
-    inner: Hnsw<'this, f32, DistCosine>,
-}
-
-#[self_referencing]
-pub(crate) struct MmapedHnswDot {
-    dump_dir: TempDir,
-    io: HnswIo,
-    #[borrows(mut io)]
-    #[not_covariant]
-    inner: Hnsw<'this, f32, DistDot>,
-}
-
-/// Search index: mmap-backed reload from an `hnsw_rs` dump on disk (temp dir under the segment
-/// reader).
-pub(crate) enum VectorIndexInner {
-    L2(MmapedHnswL2),
-    Cosine(MmapedHnswCosine),
-    Dot(MmapedHnswDot),
-}
-
-impl VectorIndexInner {
-    pub(crate) fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Neighbour> {
-        match self {
-            Self::L2(l) => l.search(query, k, ef),
-            Self::Cosine(l) => l.search(query, k, ef),
-            Self::Dot(l) => l.search(query, k, ef),
-        }
-    }
-}
-
-impl MmapedHnswL2 {
-    pub(crate) fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Neighbour> {
-        self.with_inner(|h| h.search(query, k, ef))
-    }
-}
-
-impl MmapedHnswCosine {
-    pub(crate) fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Neighbour> {
-        self.with_inner(|h| h.search(query, k, ef))
-    }
-}
-
-impl MmapedHnswDot {
-    pub(crate) fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Neighbour> {
-        self.with_inner(|h| h.search(query, k, ef))
-    }
-}
-
-fn write_dump_files(dir: &Path, basename: &str, graph: &[u8], data: &[u8]) -> crate::Result<()> {
-    fs::write(dir.join(format!("{basename}.hnsw.graph")), graph)
-        .map_err(|e| TantivyError::InternalError(format!("write hnsw graph temp: {e}")))?;
-    fs::write(dir.join(format!("{basename}.hnsw.data")), data)
-        .map_err(|e| TantivyError::InternalError(format!("write hnsw data temp: {e}")))?;
-    Ok(())
-}
-
-fn load_mmap_after_dump_on_disk(
-    options: &VectorOptions,
-    dir: TempDir,
-    basename: &str,
-) -> crate::Result<VectorIndexInner> {
-    let io = HnswIo::new_with_options(dir.path(), basename, ReloadOptions::new(true));
-    match options.distance {
-        VectorDistance::Euclidean => {
-            let mmaped = MmapedHnswL2::try_new(dir, io, |io: &mut HnswIo| {
-                let mut h = io
-                    .load_hnsw::<f32, DistL2>()
-                    .map_err(|e| TantivyError::InternalError(format!("hnsw load (L2): {e}")))?;
-                h.set_searching_mode(true);
-                Ok::<_, TantivyError>(h)
-            })?;
-            Ok(VectorIndexInner::L2(mmaped))
-        }
-        VectorDistance::Cosine => {
-            let mmaped = MmapedHnswCosine::try_new(dir, io, |io: &mut HnswIo| {
-                let mut h = io
-                    .load_hnsw::<f32, DistCosine>()
-                    .map_err(|e| TantivyError::InternalError(format!("hnsw load (Cosine): {e}")))?;
-                h.set_searching_mode(true);
-                Ok::<_, TantivyError>(h)
-            })?;
-            Ok(VectorIndexInner::Cosine(mmaped))
-        }
-        VectorDistance::DotProduct => {
-            let mmaped = MmapedHnswDot::try_new(dir, io, |io: &mut HnswIo| {
-                let mut h = io
-                    .load_hnsw::<f32, DistDot>()
-                    .map_err(|e| TantivyError::InternalError(format!("hnsw load (Dot): {e}")))?;
-                h.set_searching_mode(true);
-                Ok::<_, TantivyError>(h)
-            })?;
-            Ok(VectorIndexInner::Dot(mmaped))
-        }
-    }
-}
-
-/// Open the search index: graph/data bytes from the segment, or build+dump from `flat` (legacy).
-pub(crate) fn open_vector_index(
-    options: &VectorOptions,
-    graph: &[u8],
-    data: &[u8],
-    max_doc: u32,
+/// Run an approximate k-NN search on the compact HNSW graph.
+pub(crate) fn search(
+    graph: &CompactHnswGraph,
     flat: &[f32],
-) -> crate::Result<VectorIndexInner> {
-    if !graph.is_empty() && !data.is_empty() {
-        let dir = tempfile::tempdir().map_err(|e| {
-            TantivyError::InternalError(format!("temp dir for hnsw mmap load: {e}"))
-        })?;
-        let basename = "tntv";
-        write_dump_files(dir.path(), basename, graph, data)?;
-        return load_mmap_after_dump_on_disk(options, dir, basename);
+    dim: usize,
+    dist: VectorDistance,
+    query: &[f32],
+    k: usize,
+    ef: usize,
+) -> Vec<SearchResult> {
+    if graph.num_points == 0 || k == 0 {
+        return Vec::new();
     }
 
-    // Legacy or missing dump: build from flat, dump to temp, then same mmap reload path.
-    if max_doc == 0 || flat.is_empty() {
-        return Err(TantivyError::InvalidArgument(
-            "vector index: missing graph/data and no vectors to rebuild from".to_string(),
-        ));
+    let distance = distance_fn_for(dist);
+    let get_vec = |id: u32| -> &[f32] {
+        let start = id as usize * dim;
+        &flat[start..start + dim]
+    };
+
+    let mut current = graph.entry_point;
+    let mut current_dist = distance(query, get_vec(current));
+
+    // Greedy descent: layers entry_layer → 1  (skip layer 0 — that gets the beam search).
+    for layer in (1..=graph.entry_layer as usize).rev() {
+        loop {
+            let mut improved = false;
+            for &neighbor in graph.neighbors(current, layer) {
+                let d = distance(query, get_vec(neighbor));
+                if d < current_dist {
+                    current = neighbor;
+                    current_dist = d;
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
     }
-    let built = build_hnsw_for_flat(options, max_doc, flat)?;
-    let dir = tempfile::tempdir()
-        .map_err(|e| TantivyError::InternalError(format!("temp dir for hnsw rebuild dump: {e}")))?;
-    let basename = match &built {
-        BuiltHnsw::L2(h) => h.file_dump(dir.path(), "tntv"),
-        BuiltHnsw::Cosine(h) => h.file_dump(dir.path(), "tntv"),
-        BuiltHnsw::Dot(h) => h.file_dump(dir.path(), "tntv"),
+
+    // ef-bounded beam search at layer 0.
+    let ef_actual = ef.max(k);
+    let mut candidates: BinaryHeap<Reverse<DistId>> = BinaryHeap::new();
+    let mut results: BinaryHeap<DistId> = BinaryHeap::new();
+    let mut visited = VisitedSet::new(graph.num_points);
+
+    visited.mark(current);
+    candidates.push(Reverse(DistId(current_dist, current)));
+    results.push(DistId(current_dist, current));
+
+    while let Some(Reverse(DistId(c_dist, c_id))) = candidates.pop() {
+        let worst = results.peek().map_or(f32::INFINITY, |d| d.0);
+        if c_dist > worst && results.len() >= ef_actual {
+            break;
+        }
+
+        for &neighbor in graph.neighbors(c_id, 0) {
+            if !visited.mark(neighbor) {
+                continue; // already visited
+            }
+            let d = distance(query, get_vec(neighbor));
+            let worst = results.peek().map_or(f32::INFINITY, |r| r.0);
+            if d < worst || results.len() < ef_actual {
+                candidates.push(Reverse(DistId(d, neighbor)));
+                results.push(DistId(d, neighbor));
+                if results.len() > ef_actual {
+                    results.pop(); // remove farthest
+                }
+            }
+        }
     }
-    .map_err(|e| TantivyError::InternalError(format!("hnsw file_dump (rebuild): {e}")))?;
-    load_mmap_after_dump_on_disk(options, dir, &basename)
+
+    let mut out: Vec<SearchResult> = results
+        .into_iter()
+        .map(|DistId(d, id)| SearchResult {
+            doc_id: id,
+            distance: d,
+        })
+        .collect();
+    out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    out.truncate(k);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Ordered (distance, id) pair for BinaryHeap. Uses `total_cmp` so NaN is handled.
+#[derive(Clone, Copy, PartialEq)]
+struct DistId(f32, u32);
+
+impl Eq for DistId {}
+
+impl PartialOrd for DistId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DistId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0).then(self.1.cmp(&other.1))
+    }
+}
+
+/// Bit-vector for O(1) visited checks instead of a `HashSet`.
+struct VisitedSet {
+    bits: Vec<u64>,
+}
+
+impl VisitedSet {
+    fn new(n: u32) -> Self {
+        let words = (n as usize).div_ceil(64);
+        Self {
+            bits: vec![0u64; words],
+        }
+    }
+
+    /// Mark `id` as visited; returns `true` if it was **not** previously visited.
+    #[inline]
+    fn mark(&mut self, id: u32) -> bool {
+        let word = id as usize / 64;
+        let bit = 1u64 << (id % 64);
+        if self.bits[word] & bit != 0 {
+            return false;
+        }
+        self.bits[word] |= bit;
+        true
+    }
 }

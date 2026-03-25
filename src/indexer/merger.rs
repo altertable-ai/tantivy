@@ -20,7 +20,7 @@ use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
-use crate::vector::{build_hnsw_from_flat, write_vec_file, FlatStorage, VectorFieldBundle};
+use crate::vector::{build_compact_graph_from_flat, write_vec_file, VectorFieldBundle};
 use crate::{DocAddress, DocId, InvertedIndexReader};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
@@ -558,16 +558,13 @@ impl IndexMerger {
                 };
                 flat.extend_from_slice(slice);
             }
-            let (graph, data, hnsw_dump_keepalive) =
-                build_hnsw_from_flat(options, self.max_doc, &flat)?;
+            let graph = build_compact_graph_from_flat(options, self.max_doc, &flat)?;
             bundles.push(VectorFieldBundle {
                 field_id: field.field_id(),
                 options: options.clone(),
-                graph,
-                data,
-                flat: FlatStorage::Owned(flat),
                 num_docs: self.max_doc,
-                hnsw_dump_keepalive,
+                flat,
+                graph,
             });
         }
         write_vec_file(&mut vec_write, &bundles)?;

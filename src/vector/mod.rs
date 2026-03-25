@@ -8,10 +8,9 @@ mod mmaped_hnsw;
 pub(crate) mod reader;
 pub(crate) mod writer;
 
-pub(crate) use io::{write_vec_file, FlatStorage, VectorFieldBundle};
-pub(crate) use mmaped_hnsw::VectorIndexInner;
+pub(crate) use io::{write_vec_file, VectorFieldBundle};
 pub use reader::{VectorFieldReader, VectorFieldReaders};
-pub(crate) use writer::{build_hnsw_from_flat, VectorFieldsWriter};
+pub(crate) use writer::{build_compact_graph_from_flat, VectorFieldsWriter};
 
 #[cfg(test)]
 mod tests;

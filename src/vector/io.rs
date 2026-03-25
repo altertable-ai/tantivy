@@ -1,101 +1,208 @@
-//! On-disk layout for the `.vec` segment file (HNSW dump + dense vectors for merge).
+//! On-disk layout for the `.vec` segment file.
+//!
+//! **V2 format** (magic `TNVYVEC2`): compact graph + zstd-compressed flat vectors.
+//! Eliminates the redundant `hnsw_rs` data dump (which duplicated the flat vectors)
+//! and compresses everything with zstd.
+//!
+//! Layout per field:
+//!   field_id (u32 LE), options JSON (len-prefixed), num_docs (u32 LE), dimension (u32 LE),
+//!   zstd-compressed flat vectors (len-prefixed u64 LE blob),
+//!   zstd-compressed compact HNSW graph (len-prefixed u64 LE blob).
 
 use std::io::Write;
-use std::ops::Range;
 use std::sync::Arc;
 
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
-#[cfg(feature = "mmap")]
-use tempfile::TempDir;
 
-use crate::directory::{FileSlice, OwnedBytes};
-use crate::schema::VectorOptions;
+use crate::directory::FileSlice;
+use crate::schema::{VectorDistance, VectorOptions};
 use crate::TantivyError;
 
-pub(crate) const MAGIC: &[u8; 8] = b"TNVYVEC1";
-pub(crate) const FLAT_MAGIC: &[u8; 8] = b"TNVYFLT1";
-const VERSION: u32 = 1;
+pub(crate) const MAGIC: &[u8; 8] = b"TNVYVEC2";
+const VERSION: u32 = 2;
 
-/// Graph or data bytes from the writer, or a sub-range of a mmap-backed segment file.
-pub(crate) enum BytesMaybeMmap {
-    Owned(Vec<u8>),
-    Slice {
-        backing: Arc<OwnedBytes>,
-        range: Range<usize>,
-    },
+const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+
+// ---------------------------------------------------------------------------
+// Compact HNSW graph
+// ---------------------------------------------------------------------------
+
+/// In-memory HNSW graph for search.  Stores only topology (neighbor IDs), not
+/// vectors or distances — those are recomputed from the flat store at query time.
+///
+/// The adjacency data lives in three contiguous vectors instead of
+/// `Vec<Vec<Vec<u32>>>`, avoiding O(N × layers) small heap allocations:
+///
+/// * `layer_counts[point]` — how many layers this point participates in.
+/// * `adj_offsets[point]`  — index into `adj_data` where this point's packed
+///   neighbor lists begin.
+/// * `adj_data`            — packed sequences of `[count_u32, id, id, …]` for
+///   each layer of each point (layer 0 first, then layer 1, …).
+pub(crate) struct CompactHnswGraph {
+    pub entry_point: u32,
+    pub entry_layer: u8,
+    pub num_points: u32,
+    layer_counts: Vec<u8>,
+    adj_offsets: Vec<u32>,
+    adj_data: Vec<u32>,
 }
 
-impl BytesMaybeMmap {
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Owned(v) => v.as_slice(),
-            Self::Slice { backing, range } => backing.as_slice().get(range.clone()).unwrap_or(&[]),
+impl CompactHnswGraph {
+    /// Build from per-point adjacency lists (convenience for the hnsw_rs extraction
+    /// path which naturally produces `Vec<Vec<Vec<u32>>>`).
+    pub(crate) fn new(
+        entry_point: u32,
+        entry_layer: u8,
+        num_points: u32,
+        adjacency: Vec<Vec<Vec<u32>>>,
+    ) -> Self {
+        let n = adjacency.len();
+        let mut layer_counts = Vec::with_capacity(n);
+        let mut adj_offsets = Vec::with_capacity(n);
+        let total: usize = adjacency
+            .iter()
+            .map(|layers| layers.iter().map(|nb| 1 + nb.len()).sum::<usize>())
+            .sum();
+        let mut adj_data = Vec::with_capacity(total);
+
+        for layers in &adjacency {
+            layer_counts.push(layers.len() as u8);
+            adj_offsets.push(adj_data.len() as u32);
+            for neighbors in layers {
+                adj_data.push(neighbors.len() as u32);
+                adj_data.extend_from_slice(neighbors);
+            }
+        }
+
+        Self {
+            entry_point,
+            entry_layer,
+            num_points,
+            layer_counts,
+            adj_offsets,
+            adj_data,
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Owned(v) => v.len(),
-            Self::Slice { range, .. } => range.len(),
+    /// Neighbor IDs for `point` at `layer`.  O(layer) scan over the packed
+    /// counts, but layers are almost always 0 (rarely > 1), so effectively O(1).
+    #[inline]
+    pub(crate) fn neighbors(&self, point: u32, layer: usize) -> &[u32] {
+        let idx = point as usize;
+        let lc = match self.layer_counts.get(idx) {
+            Some(&lc) => lc as usize,
+            None => return &[],
+        };
+        if layer >= lc {
+            return &[];
         }
+        let mut off = self.adj_offsets[idx] as usize;
+        for _ in 0..layer {
+            let count = self.adj_data[off] as usize;
+            off += 1 + count;
+        }
+        let count = self.adj_data[off] as usize;
+        &self.adj_data[off + 1..off + 1 + count]
+    }
+
+    /// Serialize to a byte buffer (before zstd compression).
+    ///
+    /// Wire format:
+    /// ```text
+    /// entry_point: u32 LE
+    /// entry_layer: u8
+    /// num_points:  u32 LE
+    /// layer_counts: [u8; num_points]
+    /// per point, per layer: num_neighbors u16 LE, [neighbor_id u32 LE; ...]
+    /// ```
+    pub(crate) fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.entry_point.to_le_bytes());
+        buf.push(self.entry_layer);
+        buf.extend_from_slice(&self.num_points.to_le_bytes());
+
+        buf.extend_from_slice(&self.layer_counts);
+
+        let n = self.num_points as usize;
+        for i in 0..n {
+            let lc = self.layer_counts[i] as usize;
+            let mut off = self.adj_offsets[i] as usize;
+            for _ in 0..lc {
+                let count = self.adj_data[off] as usize;
+                let count16 = count.min(u16::MAX as usize) as u16;
+                buf.extend_from_slice(&count16.to_le_bytes());
+                for &id in &self.adj_data[off + 1..off + 1 + count16 as usize] {
+                    buf.extend_from_slice(&id.to_le_bytes());
+                }
+                off += 1 + count;
+            }
+        }
+        buf
+    }
+
+    /// Deserialize from the raw (decompressed) byte buffer.
+    pub(crate) fn deserialize(buf: &[u8]) -> crate::Result<Self> {
+        let mut pos = 0usize;
+        let entry_point = read_u32_le(buf, &mut pos)?;
+        if buf.len() <= pos {
+            return Err(corruption("compact graph: truncated entry_layer"));
+        }
+        let entry_layer = buf[pos];
+        pos += 1;
+        let num_points = read_u32_le(buf, &mut pos)? as usize;
+
+        if buf.len() < pos + num_points {
+            return Err(corruption("compact graph: truncated layer counts"));
+        }
+        let layer_counts: Vec<u8> = buf[pos..pos + num_points].to_vec();
+        pos += num_points;
+
+        let mut adj_offsets = Vec::with_capacity(num_points);
+        let mut adj_data = Vec::new();
+
+        for &lc in &layer_counts {
+            adj_offsets.push(adj_data.len() as u32);
+            for _ in 0..lc {
+                let count = read_u16_le(buf, &mut pos)? as usize;
+                let needed = count * 4;
+                if buf.len() < pos + needed {
+                    return Err(corruption("compact graph: truncated neighbor list"));
+                }
+                adj_data.push(count as u32);
+                for _ in 0..count {
+                    adj_data.push(read_u32_le(buf, &mut pos)?);
+                }
+            }
+        }
+
+        Ok(Self {
+            entry_point,
+            entry_layer,
+            num_points: num_points as u32,
+            layer_counts,
+            adj_offsets,
+            adj_data,
+        })
     }
 }
 
-/// Keeps the temp directory and mmap-backed [`OwnedBytes`] alive while copying HNSW bytes into
-/// `.vec` (see [`VectorFieldBundle::hnsw_dump_keepalive`]).
-#[cfg(feature = "mmap")]
-pub(crate) struct HnswDumpKeepalive {
-    pub(crate) _dir: TempDir,
-    pub(crate) graph: OwnedBytes,
-    pub(crate) data: OwnedBytes,
-}
+// ---------------------------------------------------------------------------
+// V2 bundle written during indexing / merge
+// ---------------------------------------------------------------------------
 
-#[cfg(feature = "mmap")]
-impl HnswDumpKeepalive {
-    pub(crate) fn as_bundle_slices(self: &Arc<Self>) -> (BytesMaybeMmap, BytesMaybeMmap) {
-        let glen = self.graph.len();
-        let dlen = self.data.len();
-        (
-            BytesMaybeMmap::Slice {
-                backing: Arc::new(self.graph.clone()),
-                range: 0..glen,
-            },
-            BytesMaybeMmap::Slice {
-                backing: Arc::new(self.data.clone()),
-                range: 0..dlen,
-            },
-        )
-    }
-}
-
-/// When `mmap` is disabled, [`VectorFieldBundle::hnsw_dump_keepalive`] is always `None`.
-#[cfg(not(feature = "mmap"))]
-pub(crate) struct HnswDumpKeepalive(());
-
-/// Row-major `f32` (`num_docs * dimension`) from the writer, or a mmap view of the `.vec` file.
-pub(crate) enum FlatStorage {
-    Owned(Vec<f32>),
-    Mmap {
-        backing: Arc<OwnedBytes>,
-        range: Range<usize>,
-    },
-}
-
-/// Serialized payload for one vector field inside the `.vec` file.
+/// Payload for one vector field going into the `.vec` file.
 pub(crate) struct VectorFieldBundle {
     pub field_id: u32,
     pub options: VectorOptions,
-    pub graph: BytesMaybeMmap,
-    pub data: BytesMaybeMmap,
-    pub flat: FlatStorage,
     pub num_docs: u32,
-    /// Present only when graph/data were mmap'd from a temp `file_dump`; keeps the temp dir alive
-    /// until [`write_vec_file`] finishes. Always `None` when loaded via [`read_vec_file`].
-    #[allow(dead_code)] // Retained for drop order; not accessed otherwise.
-    pub(crate) hnsw_dump_keepalive: Option<Arc<HnswDumpKeepalive>>,
+    pub flat: Vec<f32>,
+    pub graph: CompactHnswGraph,
 }
 
-/// Writes all vector fields for a segment into `writer`.
+// ---------------------------------------------------------------------------
+// Write
+// ---------------------------------------------------------------------------
+
 pub(crate) fn write_vec_file(
     writer: &mut dyn Write,
     fields: &[VectorFieldBundle],
@@ -103,168 +210,300 @@ pub(crate) fn write_vec_file(
     writer.write_all(MAGIC)?;
     writer.write_u32::<LittleEndian>(VERSION)?;
     writer.write_u32::<LittleEndian>(fields.len() as u32)?;
+
     for bundle in fields {
         writer.write_u32::<LittleEndian>(bundle.field_id)?;
+
         let opts_json = serde_json::to_vec(&bundle.options)
             .map_err(|e| TantivyError::InternalError(format!("vector options json: {e}")))?;
         writer.write_u32::<LittleEndian>(opts_json.len() as u32)?;
         writer.write_all(&opts_json)?;
-        let graph = bundle.graph.as_slice();
-        writer.write_u64::<LittleEndian>(bundle.graph.len() as u64)?;
-        writer.write_all(graph)?;
-        let data = bundle.data.as_slice();
-        writer.write_u64::<LittleEndian>(bundle.data.len() as u64)?;
-        writer.write_all(data)?;
-        writer.write_all(FLAT_MAGIC)?;
+
         writer.write_u32::<LittleEndian>(bundle.num_docs)?;
         writer.write_u32::<LittleEndian>(bundle.options.dimension as u32)?;
-        match &bundle.flat {
-            FlatStorage::Owned(v) => {
-                // `.vec` stores little-endian `f32`; on LE hosts write the buffer in one shot.
-                #[cfg(target_endian = "little")]
-                {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            v.as_ptr() as *const u8,
-                            v.len() * std::mem::size_of::<f32>(),
-                        )
-                    };
-                    writer.write_all(bytes)?;
-                }
-                #[cfg(not(target_endian = "little"))]
-                {
-                    for &f in v {
-                        writer.write_f32::<LittleEndian>(f)?;
-                    }
-                }
-            }
-            FlatStorage::Mmap { .. } => {
-                return Err(TantivyError::InternalError(
-                    "write_vec_file: flat vectors must be owned".to_string(),
-                ));
-            }
-        }
+
+        // --- flat vectors: zstd-compressed ---
+        let flat_bytes = flat_to_le_bytes(&bundle.flat);
+        let flat_compressed = zstd_compress(&flat_bytes)?;
+        writer.write_u64::<LittleEndian>(flat_compressed.len() as u64)?;
+        writer.write_all(&flat_compressed)?;
+
+        // --- compact graph: zstd-compressed ---
+        let graph_raw = bundle.graph.serialize();
+        let graph_compressed = zstd_compress(&graph_raw)?;
+        writer.write_u64::<LittleEndian>(graph_compressed.len() as u64)?;
+        writer.write_all(&graph_compressed)?;
     }
     Ok(())
 }
 
-fn read_u32_le(buf: &[u8], pos: &mut usize) -> crate::Result<u32> {
-    if buf.len() < *pos + 4 {
-        return Err(TantivyError::DataCorruption(
-            crate::error::DataCorruption::comment_only(".vec truncated (u32)"),
-        ));
+// ---------------------------------------------------------------------------
+// Read
+// ---------------------------------------------------------------------------
+
+/// Loaded bundle: decompressed flat vectors + compact graph ready for search.
+pub(crate) struct LoadedVectorField {
+    pub field_id: u32,
+    pub options: VectorOptions,
+    pub num_docs: u32,
+    pub flat: Vec<f32>,
+    pub graph: CompactHnswGraph,
+}
+
+pub(crate) fn read_vec_file(data: FileSlice) -> crate::Result<Vec<LoadedVectorField>> {
+    let backing = Arc::new(data.read_bytes()?);
+    let buf = backing.as_slice();
+    let mut pos = 0usize;
+
+    if buf.len() < 8 {
+        return Err(corruption("invalid .vec file (too short)"));
     }
+
+    if &buf[..8] == MAGIC {
+        read_vec_v2(buf, &mut pos)
+    } else if &buf[..8] == b"TNVYVEC1" {
+        read_vec_v1(buf, &mut pos)
+    } else {
+        Err(corruption("invalid .vec magic"))
+    }
+}
+
+fn read_vec_v2(buf: &[u8], pos: &mut usize) -> crate::Result<Vec<LoadedVectorField>> {
+    *pos += 8; // magic
+    let _version = read_u32_le(buf, pos)?;
+    let n_fields = read_u32_le(buf, pos)? as usize;
+
+    let mut out = Vec::with_capacity(n_fields);
+    for _ in 0..n_fields {
+        let field_id = read_u32_le(buf, pos)?;
+
+        let opt_len = read_u32_le(buf, pos)? as usize;
+        check_len(buf, *pos, opt_len, "options")?;
+        let options: VectorOptions =
+            serde_json::from_slice(&buf[*pos..*pos + opt_len]).map_err(|e| {
+                corruption(format!("vector options: {e}"))
+            })?;
+        *pos += opt_len;
+
+        let num_docs = read_u32_le(buf, pos)?;
+        let dimension = read_u32_le(buf, pos)? as usize;
+
+        // flat vectors (zstd)
+        let flat_clen = read_u64_le(buf, pos)? as usize;
+        check_len(buf, *pos, flat_clen, "flat compressed")?;
+        let flat_decompressed = zstd_decompress(&buf[*pos..*pos + flat_clen])?;
+        *pos += flat_clen;
+        let flat = le_bytes_to_flat(&flat_decompressed, num_docs as usize * dimension)?;
+
+        // graph (zstd)
+        let graph_clen = read_u64_le(buf, pos)? as usize;
+        check_len(buf, *pos, graph_clen, "graph compressed")?;
+        let graph_decompressed = zstd_decompress(&buf[*pos..*pos + graph_clen])?;
+        *pos += graph_clen;
+        let graph = CompactHnswGraph::deserialize(&graph_decompressed)?;
+
+        out.push(LoadedVectorField {
+            field_id,
+            options,
+            num_docs,
+            flat,
+            graph,
+        });
+    }
+    Ok(out)
+}
+
+/// Backward-compatible reader for the V1 format (TNVYVEC1).
+/// Reads graph + data + flat from the old uncompressed layout, but discards the
+/// hnsw_rs data dump (we rebuild the compact graph at open time from the old graph
+/// bytes through the hnsw_rs reload path).
+fn read_vec_v1(buf: &[u8], pos: &mut usize) -> crate::Result<Vec<LoadedVectorField>> {
+    *pos += 8; // magic
+    let _version = read_u32_le(buf, pos)?;
+    let n_fields = read_u32_le(buf, pos)? as usize;
+
+    let mut out = Vec::with_capacity(n_fields);
+    for _ in 0..n_fields {
+        let field_id = read_u32_le(buf, pos)?;
+
+        let opt_len = read_u32_le(buf, pos)? as usize;
+        check_len(buf, *pos, opt_len, "v1 options")?;
+        let options: VectorOptions =
+            serde_json::from_slice(&buf[*pos..*pos + opt_len]).map_err(|e| {
+                corruption(format!("v1 vector options: {e}"))
+            })?;
+        *pos += opt_len;
+
+        // graph blob (skip — we'll rebuild from flat)
+        let graph_len = read_u64_le(buf, pos)? as usize;
+        check_len(buf, *pos, graph_len, "v1 graph")?;
+        *pos += graph_len;
+
+        // data blob (skip — redundant with flat)
+        let data_len = read_u64_le(buf, pos)? as usize;
+        check_len(buf, *pos, data_len, "v1 data")?;
+        *pos += data_len;
+
+        // flat magic
+        let flat_magic = b"TNVYFLT1";
+        check_len(buf, *pos, 8, "v1 flat magic")?;
+        if &buf[*pos..*pos + 8] != flat_magic {
+            return Err(corruption("v1: invalid flat magic"));
+        }
+        *pos += 8;
+
+        let num_docs = read_u32_le(buf, pos)?;
+        let dim = read_u32_le(buf, pos)? as usize;
+        let flat_byte_len = num_docs as usize * dim * 4;
+        check_len(buf, *pos, flat_byte_len, "v1 flat")?;
+        let flat = le_bytes_to_flat(&buf[*pos..*pos + flat_byte_len], num_docs as usize * dim)?;
+        *pos += flat_byte_len;
+
+        // Rebuild HNSW from flat vectors (V1 compat path).
+        let graph = rebuild_graph_from_flat(&options, num_docs, &flat)?;
+
+        out.push(LoadedVectorField {
+            field_id,
+            options,
+            num_docs,
+            flat,
+            graph,
+        });
+    }
+    Ok(out)
+}
+
+fn rebuild_graph_from_flat(
+    options: &VectorOptions,
+    num_docs: u32,
+    flat: &[f32],
+) -> crate::Result<CompactHnswGraph> {
+    if num_docs == 0 {
+        return Ok(CompactHnswGraph::new(0, 0, 0, Vec::new()));
+    }
+    crate::vector::hnsw::extract_compact_graph(options, num_docs, flat)
+}
+
+// ---------------------------------------------------------------------------
+// Distance helpers (used by the search module)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn distance_to_score(distance: f32) -> crate::Score {
+    1.0 / (1.0 + distance)
+}
+
+pub(crate) fn distance_fn_for(dist: VectorDistance) -> fn(&[f32], &[f32]) -> f32 {
+    match dist {
+        VectorDistance::Euclidean => dist_l2,
+        VectorDistance::Cosine => dist_cosine,
+        VectorDistance::DotProduct => dist_dot,
+    }
+}
+
+fn dist_l2(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum::<f32>()
+        .sqrt()
+}
+
+fn dist_cosine(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let (xd, yd) = (x as f64, y as f64);
+        dot += xd * yd;
+        na += xd * xd;
+        nb += yd * yd;
+    }
+    if na > 0.0 && nb > 0.0 {
+        (1.0 - dot / (na * nb).sqrt()).max(0.0) as f32
+    } else {
+        0.0
+    }
+}
+
+fn dist_dot(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
+    (1.0 - dot).max(0.0)
+}
+
+// ---------------------------------------------------------------------------
+// Compression helpers
+// ---------------------------------------------------------------------------
+
+fn zstd_compress(data: &[u8]) -> crate::Result<Vec<u8>> {
+    zstd::bulk::compress(data, ZSTD_COMPRESSION_LEVEL)
+        .map_err(|e| TantivyError::InternalError(format!("zstd compress: {e}")))
+}
+
+fn zstd_decompress(data: &[u8]) -> crate::Result<Vec<u8>> {
+    // Allow up to 2 GiB decompressed; real payloads are much smaller.
+    zstd::bulk::decompress(data, 2 << 30)
+        .map_err(|e| TantivyError::InternalError(format!("zstd decompress: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Byte-level helpers
+// ---------------------------------------------------------------------------
+
+fn flat_to_le_bytes(flat: &[f32]) -> Vec<u8> {
+    let mut out = vec![0u8; flat.len() * 4];
+    for (i, &f) in flat.iter().enumerate() {
+        LittleEndian::write_f32(&mut out[i * 4..(i + 1) * 4], f);
+    }
+    out
+}
+
+fn le_bytes_to_flat(bytes: &[u8], expected_floats: usize) -> crate::Result<Vec<f32>> {
+    if bytes.len() != expected_floats * 4 {
+        return Err(corruption(format!(
+            "flat size mismatch: {} bytes for {} floats",
+            bytes.len(),
+            expected_floats
+        )));
+    }
+    let mut v = Vec::with_capacity(expected_floats);
+    for chunk in bytes.chunks_exact(4) {
+        v.push(LittleEndian::read_f32(chunk));
+    }
+    Ok(v)
+}
+
+fn read_u16_le(buf: &[u8], pos: &mut usize) -> crate::Result<u16> {
+    check_len(buf, *pos, 2, "u16")?;
+    let v = LittleEndian::read_u16(&buf[*pos..*pos + 2]);
+    *pos += 2;
+    Ok(v)
+}
+
+fn read_u32_le(buf: &[u8], pos: &mut usize) -> crate::Result<u32> {
+    check_len(buf, *pos, 4, "u32")?;
     let v = LittleEndian::read_u32(&buf[*pos..*pos + 4]);
     *pos += 4;
     Ok(v)
 }
 
 fn read_u64_le(buf: &[u8], pos: &mut usize) -> crate::Result<u64> {
-    if buf.len() < *pos + 8 {
-        return Err(TantivyError::DataCorruption(
-            crate::error::DataCorruption::comment_only(".vec truncated (u64)"),
-        ));
-    }
+    check_len(buf, *pos, 8, "u64")?;
     let v = LittleEndian::read_u64(&buf[*pos..*pos + 8]);
     *pos += 8;
     Ok(v)
 }
 
-/// Reads the `.vec` file into bundles. The returned [`FlatStorage::Mmap`] views borrow the
-/// underlying [`OwnedBytes`] (typically mmap-backed when using
-/// [`crate::directory::MmapDirectory`]), so vector rows are not copied out of the segment file.
-pub(crate) fn read_vec_file(data: FileSlice) -> crate::Result<Vec<VectorFieldBundle>> {
-    let backing = Arc::new(data.read_bytes()?);
-    let buf = backing.as_slice();
-    let mut pos = 0usize;
-
-    if buf.len() < 8 || buf[..8] != *MAGIC {
-        return Err(TantivyError::DataCorruption(
-            crate::error::DataCorruption::comment_only("invalid .vec magic"),
-        ));
+fn check_len(buf: &[u8], pos: usize, need: usize, what: &str) -> crate::Result<()> {
+    if buf.len() < pos + need {
+        Err(corruption(format!(".vec truncated ({what})")))
+    } else {
+        Ok(())
     }
-    pos += 8;
-    let _version = read_u32_le(buf, &mut pos)?;
-    let n_fields = read_u32_le(buf, &mut pos)? as usize;
-
-    let mut out = Vec::with_capacity(n_fields);
-    for _ in 0..n_fields {
-        let field_id = read_u32_le(buf, &mut pos)?;
-        let opt_len = read_u32_le(buf, &mut pos)? as usize;
-        if buf.len() < pos + opt_len {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(".vec truncated (options)"),
-            ));
-        }
-        let options: VectorOptions =
-            serde_json::from_slice(&buf[pos..pos + opt_len]).map_err(|e| {
-                TantivyError::DataCorruption(crate::error::DataCorruption::comment_only(format!(
-                    "vector options: {e}"
-                )))
-            })?;
-        pos += opt_len;
-
-        let graph_len = read_u64_le(buf, &mut pos)? as usize;
-        if buf.len() < pos + graph_len {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(".vec truncated (graph)"),
-            ));
-        }
-        let graph = BytesMaybeMmap::Slice {
-            backing: Arc::clone(&backing),
-            range: pos..pos + graph_len,
-        };
-        pos += graph_len;
-
-        let data_len = read_u64_le(buf, &mut pos)? as usize;
-        if buf.len() < pos + data_len {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(".vec truncated (data)"),
-            ));
-        }
-        let data = BytesMaybeMmap::Slice {
-            backing: Arc::clone(&backing),
-            range: pos..pos + data_len,
-        };
-        pos += data_len;
-
-        if buf.len() < pos + 8 || buf[pos..pos + 8] != *FLAT_MAGIC {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only("invalid flat magic in .vec"),
-            ));
-        }
-        pos += 8;
-
-        let num_docs = read_u32_le(buf, &mut pos)?;
-        let dim = read_u32_le(buf, &mut pos)? as usize;
-        let flat_byte_len = num_docs as usize * dim * 4;
-        if buf.len() < pos + flat_byte_len {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(".vec truncated (flat)"),
-            ));
-        }
-        let flat = FlatStorage::Mmap {
-            backing: Arc::clone(&backing),
-            range: pos..pos + flat_byte_len,
-        };
-        pos += flat_byte_len;
-
-        out.push(VectorFieldBundle {
-            field_id,
-            options,
-            graph,
-            data,
-            flat,
-            num_docs,
-            hnsw_dump_keepalive: None,
-        });
-    }
-
-    debug_assert_eq!(pos, buf.len());
-    Ok(out)
 }
 
-pub(crate) fn distance_to_score(distance: f32) -> crate::Score {
-    // Higher is better for collectors; distance is lower-is-better.
-    1.0 / (1.0 + distance)
+fn corruption(msg: impl std::fmt::Display) -> TantivyError {
+    TantivyError::DataCorruption(crate::error::DataCorruption::comment_only(msg))
 }
