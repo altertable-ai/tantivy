@@ -34,10 +34,9 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 /// `Vec<Vec<Vec<u32>>>`, avoiding O(N × layers) small heap allocations:
 ///
 /// * `layer_counts[point]` — how many layers this point participates in.
-/// * `adj_offsets[point]`  — index into `adj_data` where this point's packed
-///   neighbor lists begin.
-/// * `adj_data`            — packed sequences of `[count_u32, id, id, …]` for
-///   each layer of each point (layer 0 first, then layer 1, …).
+/// * `adj_offsets[point]`  — index into `adj_data` where this point's packed neighbor lists begin.
+/// * `adj_data`            — packed sequences of `[count_u32, id, id, …]` for each layer of each
+///   point (layer 0 first, then layer 1, …).
 pub(crate) struct CompactHnswGraph {
     pub entry_point: u32,
     pub entry_layer: u8,
@@ -279,10 +278,8 @@ fn read_vec_v2(buf: &[u8], pos: &mut usize) -> crate::Result<Vec<LoadedVectorFie
 
         let opt_len = read_u32_le(buf, pos)? as usize;
         check_len(buf, *pos, opt_len, "options")?;
-        let options: VectorOptions =
-            serde_json::from_slice(&buf[*pos..*pos + opt_len]).map_err(|e| {
-                corruption(format!("vector options: {e}"))
-            })?;
+        let options: VectorOptions = serde_json::from_slice(&buf[*pos..*pos + opt_len])
+            .map_err(|e| corruption(format!("vector options: {e}")))?;
         *pos += opt_len;
 
         let num_docs = read_u32_le(buf, pos)?;
@@ -328,10 +325,8 @@ fn read_vec_v1(buf: &[u8], pos: &mut usize) -> crate::Result<Vec<LoadedVectorFie
 
         let opt_len = read_u32_le(buf, pos)? as usize;
         check_len(buf, *pos, opt_len, "v1 options")?;
-        let options: VectorOptions =
-            serde_json::from_slice(&buf[*pos..*pos + opt_len]).map_err(|e| {
-                corruption(format!("v1 vector options: {e}"))
-            })?;
+        let options: VectorOptions = serde_json::from_slice(&buf[*pos..*pos + opt_len])
+            .map_err(|e| corruption(format!("v1 vector options: {e}")))?;
         *pos += opt_len;
 
         // graph blob (skip — we'll rebuild from flat)
