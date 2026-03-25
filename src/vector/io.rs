@@ -10,7 +10,6 @@
 //!   zstd-compressed compact HNSW graph (len-prefixed u64 LE blob).
 
 use std::io::Write;
-use std::sync::Arc;
 
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 
@@ -250,53 +249,47 @@ pub(crate) struct LoadedVectorField {
 }
 
 pub(crate) fn read_vec_file(data: FileSlice) -> crate::Result<Vec<LoadedVectorField>> {
-    let backing = Arc::new(data.read_bytes()?);
-    let buf = backing.as_slice();
+    let bytes = data.read_bytes()?;
+    let buf = bytes.as_slice();
     let mut pos = 0usize;
 
-    if buf.len() < 8 {
-        return Err(corruption("invalid .vec file (too short)"));
+    check_len(buf, 0, 8, "magic")?;
+    if &buf[..8] != MAGIC {
+        return Err(corruption(format!(
+            "unsupported .vec format (expected TNVYVEC2, got {:?})",
+            std::str::from_utf8(&buf[..8]).unwrap_or("???")
+        )));
     }
+    pos += 8;
 
-    if &buf[..8] == MAGIC {
-        read_vec_v2(buf, &mut pos)
-    } else if &buf[..8] == b"TNVYVEC1" {
-        read_vec_v1(buf, &mut pos)
-    } else {
-        Err(corruption("invalid .vec magic"))
-    }
-}
-
-fn read_vec_v2(buf: &[u8], pos: &mut usize) -> crate::Result<Vec<LoadedVectorField>> {
-    *pos += 8; // magic
-    let _version = read_u32_le(buf, pos)?;
-    let n_fields = read_u32_le(buf, pos)? as usize;
+    let _version = read_u32_le(buf, &mut pos)?;
+    let n_fields = read_u32_le(buf, &mut pos)? as usize;
 
     let mut out = Vec::with_capacity(n_fields);
     for _ in 0..n_fields {
-        let field_id = read_u32_le(buf, pos)?;
+        let field_id = read_u32_le(buf, &mut pos)?;
 
-        let opt_len = read_u32_le(buf, pos)? as usize;
-        check_len(buf, *pos, opt_len, "options")?;
-        let options: VectorOptions = serde_json::from_slice(&buf[*pos..*pos + opt_len])
+        let opt_len = read_u32_le(buf, &mut pos)? as usize;
+        check_len(buf, pos, opt_len, "options")?;
+        let options: VectorOptions = serde_json::from_slice(&buf[pos..pos + opt_len])
             .map_err(|e| corruption(format!("vector options: {e}")))?;
-        *pos += opt_len;
+        pos += opt_len;
 
-        let num_docs = read_u32_le(buf, pos)?;
-        let dimension = read_u32_le(buf, pos)? as usize;
+        let num_docs = read_u32_le(buf, &mut pos)?;
+        let dimension = read_u32_le(buf, &mut pos)? as usize;
 
         // flat vectors (zstd)
-        let flat_clen = read_u64_le(buf, pos)? as usize;
-        check_len(buf, *pos, flat_clen, "flat compressed")?;
-        let flat_decompressed = zstd_decompress(&buf[*pos..*pos + flat_clen])?;
-        *pos += flat_clen;
+        let flat_clen = read_u64_le(buf, &mut pos)? as usize;
+        check_len(buf, pos, flat_clen, "flat compressed")?;
+        let flat_decompressed = zstd_decompress(&buf[pos..pos + flat_clen])?;
+        pos += flat_clen;
         let flat = le_bytes_to_flat(&flat_decompressed, num_docs as usize * dimension)?;
 
         // graph (zstd)
-        let graph_clen = read_u64_le(buf, pos)? as usize;
-        check_len(buf, *pos, graph_clen, "graph compressed")?;
-        let graph_decompressed = zstd_decompress(&buf[*pos..*pos + graph_clen])?;
-        *pos += graph_clen;
+        let graph_clen = read_u64_le(buf, &mut pos)? as usize;
+        check_len(buf, pos, graph_clen, "graph compressed")?;
+        let graph_decompressed = zstd_decompress(&buf[pos..pos + graph_clen])?;
+        pos += graph_clen;
         let graph = CompactHnswGraph::deserialize(&graph_decompressed)?;
 
         out.push(LoadedVectorField {
@@ -308,75 +301,6 @@ fn read_vec_v2(buf: &[u8], pos: &mut usize) -> crate::Result<Vec<LoadedVectorFie
         });
     }
     Ok(out)
-}
-
-/// Backward-compatible reader for the V1 format (TNVYVEC1).
-/// Reads graph + data + flat from the old uncompressed layout, but discards the
-/// hnsw_rs data dump (we rebuild the compact graph at open time from the old graph
-/// bytes through the hnsw_rs reload path).
-fn read_vec_v1(buf: &[u8], pos: &mut usize) -> crate::Result<Vec<LoadedVectorField>> {
-    *pos += 8; // magic
-    let _version = read_u32_le(buf, pos)?;
-    let n_fields = read_u32_le(buf, pos)? as usize;
-
-    let mut out = Vec::with_capacity(n_fields);
-    for _ in 0..n_fields {
-        let field_id = read_u32_le(buf, pos)?;
-
-        let opt_len = read_u32_le(buf, pos)? as usize;
-        check_len(buf, *pos, opt_len, "v1 options")?;
-        let options: VectorOptions = serde_json::from_slice(&buf[*pos..*pos + opt_len])
-            .map_err(|e| corruption(format!("v1 vector options: {e}")))?;
-        *pos += opt_len;
-
-        // graph blob (skip — we'll rebuild from flat)
-        let graph_len = read_u64_le(buf, pos)? as usize;
-        check_len(buf, *pos, graph_len, "v1 graph")?;
-        *pos += graph_len;
-
-        // data blob (skip — redundant with flat)
-        let data_len = read_u64_le(buf, pos)? as usize;
-        check_len(buf, *pos, data_len, "v1 data")?;
-        *pos += data_len;
-
-        // flat magic
-        let flat_magic = b"TNVYFLT1";
-        check_len(buf, *pos, 8, "v1 flat magic")?;
-        if &buf[*pos..*pos + 8] != flat_magic {
-            return Err(corruption("v1: invalid flat magic"));
-        }
-        *pos += 8;
-
-        let num_docs = read_u32_le(buf, pos)?;
-        let dim = read_u32_le(buf, pos)? as usize;
-        let flat_byte_len = num_docs as usize * dim * 4;
-        check_len(buf, *pos, flat_byte_len, "v1 flat")?;
-        let flat = le_bytes_to_flat(&buf[*pos..*pos + flat_byte_len], num_docs as usize * dim)?;
-        *pos += flat_byte_len;
-
-        // Rebuild HNSW from flat vectors (V1 compat path).
-        let graph = rebuild_graph_from_flat(&options, num_docs, &flat)?;
-
-        out.push(LoadedVectorField {
-            field_id,
-            options,
-            num_docs,
-            flat,
-            graph,
-        });
-    }
-    Ok(out)
-}
-
-fn rebuild_graph_from_flat(
-    options: &VectorOptions,
-    num_docs: u32,
-    flat: &[f32],
-) -> crate::Result<CompactHnswGraph> {
-    if num_docs == 0 {
-        return Ok(CompactHnswGraph::new(0, 0, 0, Vec::new()));
-    }
-    crate::vector::hnsw::extract_compact_graph(options, num_docs, flat)
 }
 
 // ---------------------------------------------------------------------------
