@@ -60,7 +60,7 @@ jobs:
     strategy:
       matrix:
         features:
-          - { label: "all", flags: "mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer" }
+          - { label: "all", flags: "mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer,vector" }
           - { label: "quickwit", flags: "mmap,quickwit,failpoints" }
           - { label: "none", flags: "" }
 
