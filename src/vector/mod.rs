@@ -20,7 +20,7 @@ pub use reader::{VectorFieldReader, VectorFieldReaders};
 #[cfg(feature = "vector")]
 pub(crate) use writer::{build_compact_graph_from_flat, VectorFieldsWriter};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vector"))]
 mod tests;
 
 #[cfg(not(feature = "vector"))]
