@@ -1,11 +1,15 @@
 //! Loads `.vec` segment data and runs k-NN queries.
+//!
+//! Reader open is **instant** — only metadata/offsets are parsed.
+//! Decompression of flat vectors and the HNSW graph happens on each
+//! `search()` / `vector()` / `flat_vectors()` call.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::directory::FileSlice;
 use crate::schema::Field;
-use crate::vector::io::{distance_to_score, read_vec_file, CompactHnswGraph, LoadedVectorField};
+use crate::vector::io::{distance_to_score, read_vec_file_lazy, LazyVectorField};
 use crate::vector::mmaped_hnsw;
 use crate::{DocId, Score};
 
@@ -17,11 +21,12 @@ pub struct VectorFieldReaders {
 
 impl VectorFieldReaders {
     pub(crate) fn open(data: FileSlice) -> crate::Result<Self> {
-        let bundles = read_vec_file(data)?;
-        let mut map = HashMap::with_capacity(bundles.len());
-        for bundle in bundles {
-            let reader = VectorFieldReader::from_loaded(bundle);
-            map.insert(reader.field_id, Arc::new(reader));
+        let fields = read_vec_file_lazy(data)?;
+        let mut map = HashMap::with_capacity(fields.len());
+        for lazy in fields {
+            let field_id = lazy.field_id;
+            let reader = VectorFieldReader::new(lazy);
+            map.insert(field_id, Arc::new(reader));
         }
         Ok(VectorFieldReaders {
             readers: Arc::new(map),
@@ -40,7 +45,8 @@ impl VectorFieldReaders {
     }
 }
 
-/// One vector field: compact HNSW index + decompressed dense rows.
+/// One vector field backed by compressed on-disk data.
+/// Decompression happens lazily on each query.
 pub struct VectorFieldReader {
     /// Schema field id.
     pub field_id: u32,
@@ -48,26 +54,28 @@ pub struct VectorFieldReader {
     pub options: crate::schema::VectorOptions,
     /// Number of documents indexed in this segment.
     pub num_docs: u32,
-    flat: Vec<f32>,
-    graph: CompactHnswGraph,
+    lazy: LazyVectorField,
 }
 
 impl VectorFieldReader {
-    fn from_loaded(loaded: LoadedVectorField) -> Self {
+    fn new(lazy: LazyVectorField) -> Self {
         Self {
-            field_id: loaded.field_id,
-            options: loaded.options,
-            num_docs: loaded.num_docs,
-            flat: loaded.flat,
-            graph: loaded.graph,
+            field_id: lazy.field_id,
+            options: lazy.options.clone(),
+            num_docs: lazy.num_docs,
+            lazy,
         }
     }
 
     /// Approximate k-nearest neighbors for `query` (same dimension as the field).
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(DocId, Score)> {
-        mmaped_hnsw::search(
-            &self.graph,
-            &self.flat,
+    ///
+    /// Decompresses flat vectors + HNSW graph on every call.
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> crate::Result<Vec<(DocId, Score)>> {
+        let flat = self.lazy.decompress_flat()?;
+        let graph = self.lazy.decompress_graph()?;
+        Ok(mmaped_hnsw::search(
+            &graph,
+            &flat,
             self.options.dimension,
             self.options.distance,
             query,
@@ -76,21 +84,22 @@ impl VectorFieldReader {
         )
         .into_iter()
         .map(|r| (r.doc_id as DocId, distance_to_score(r.distance)))
-        .collect()
+        .collect())
     }
 
-    /// Dense vector for `doc` in this segment, if in range.
-    pub fn vector(&self, doc: DocId) -> Option<&[f32]> {
+    /// Decompress and return all flat vectors (row-major, `num_docs * dimension` floats).
+    pub fn flat_vectors(&self) -> crate::Result<Vec<f32>> {
+        self.lazy.decompress_flat()
+    }
+
+    /// Decompress flat vectors and return the slice for a single document.
+    pub fn vector(&self, doc: DocId) -> crate::Result<Option<Vec<f32>>> {
         let dim = self.options.dimension;
         if doc >= self.num_docs {
-            return None;
+            return Ok(None);
         }
+        let flat = self.lazy.decompress_flat()?;
         let start = doc as usize * dim;
-        self.flat.get(start..start + dim)
-    }
-
-    /// Full flat storage (row-major), for segment merge.
-    pub fn flat_vectors(&self) -> &[f32] {
-        &self.flat
+        Ok(flat.get(start..start + dim).map(|s| s.to_vec()))
     }
 }

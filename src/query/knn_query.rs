@@ -99,7 +99,7 @@ impl Weight for KnnWeight {
                 dim
             )));
         }
-        let mut hits = vector_reader.search(&self.query_vector, self.k, self.ef_search);
+        let mut hits = vector_reader.search(&self.query_vector, self.k, self.ef_search)?;
         if let Some(alive) = reader.alive_bitset() {
             hits.retain(|(doc, _)| alive.is_alive(*doc));
         }

@@ -62,7 +62,7 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
     let mut best_doc = 0u32;
     let mut best_sq = f32::INFINITY;
     for d in 0..seg_reader.num_docs() {
-        let v = vread.vector(d).expect("vector row");
+        let v = vread.vector(d).expect("decompress").expect("vector row");
         let sq: f32 = v
             .iter()
             .zip(query.iter())

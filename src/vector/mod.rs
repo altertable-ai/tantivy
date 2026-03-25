@@ -99,18 +99,18 @@ pub struct VectorFieldReader {
 #[cfg(not(feature = "vector"))]
 impl VectorFieldReader {
     /// Approximate k-nearest neighbors for `query` (always empty without feature).
-    pub fn search(&self, _query: &[f32], _k: usize, _ef: usize) -> Vec<(DocId, Score)> {
-        Vec::new()
+    pub fn search(&self, _query: &[f32], _k: usize, _ef: usize) -> crate::Result<Vec<(DocId, Score)>> {
+        Ok(Vec::new())
     }
 
     /// Dense vector for `doc` in this segment, if in range.
-    pub fn vector(&self, _doc: DocId) -> Option<&[f32]> {
-        None
+    pub fn vector(&self, _doc: DocId) -> crate::Result<Option<Vec<f32>>> {
+        Ok(None)
     }
 
     /// Full flat storage (row-major), for segment merge.
-    pub fn flat_vectors(&self) -> &[f32] {
-        &[]
+    pub fn flat_vectors(&self) -> crate::Result<Vec<f32>> {
+        Ok(Vec::new())
     }
 }
 

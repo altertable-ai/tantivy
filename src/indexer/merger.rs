@@ -536,18 +536,33 @@ impl IndexMerger {
                 continue;
             };
             let dim = options.dimension;
+
+            // Pre-decompress flat vectors for each segment to avoid per-doc decompression.
+            let segment_flats: Vec<Option<Vec<f32>>> = self
+                .readers
+                .iter()
+                .map(|reader| {
+                    reader
+                        .vector_readers()
+                        .get(field)
+                        .map(|vfr| vfr.flat_vectors())
+                        .transpose()
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+
             let mut flat: Vec<f32> = Vec::with_capacity(self.max_doc as usize * dim);
             for old_addr in doc_id_mapping.iter_old_doc_addrs() {
-                let reader = &self.readers[old_addr.segment_ord as usize];
-                let Some(vfr) = reader.vector_readers().get(field) else {
-                    return Err(crate::TantivyError::DataCorruption(
+                let seg_flat = segment_flats[old_addr.segment_ord as usize].as_ref().ok_or_else(|| {
+                    crate::TantivyError::DataCorruption(
                         crate::error::DataCorruption::comment_only(format!(
                             "Missing vector reader for field {:?} during merge",
                             field_entry.name()
                         )),
-                    ));
-                };
-                let Some(slice) = vfr.vector(old_addr.doc_id) else {
+                    )
+                })?;
+                let start = old_addr.doc_id as usize * dim;
+                let end = start + dim;
+                if end > seg_flat.len() {
                     return Err(crate::TantivyError::DataCorruption(
                         crate::error::DataCorruption::comment_only(format!(
                             "Missing vector for field {:?} during merge (doc {:?})",
@@ -555,8 +570,8 @@ impl IndexMerger {
                             old_addr
                         )),
                     ));
-                };
-                flat.extend_from_slice(slice);
+                }
+                flat.extend_from_slice(&seg_flat[start..end]);
             }
             let graph = build_compact_graph_from_flat(options, self.max_doc, &flat)?;
             bundles.push(VectorFieldBundle {

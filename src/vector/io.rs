@@ -1,19 +1,22 @@
 //! On-disk layout for the `.vec` segment file.
 //!
 //! **V2 format** (magic `TNVYVEC2`): compact graph + zstd-compressed flat vectors.
-//! Eliminates the redundant `hnsw_rs` data dump (which duplicated the flat vectors)
-//! and compresses everything with zstd.
 //!
 //! Layout per field:
 //!   field_id (u32 LE), options JSON (len-prefixed), num_docs (u32 LE), dimension (u32 LE),
 //!   zstd-compressed flat vectors (len-prefixed u64 LE blob),
 //!   zstd-compressed compact HNSW graph (len-prefixed u64 LE blob).
+//!
+//! Reading is **lazy**: [`read_vec_file_lazy`] parses the header/offsets but does
+//! *not* decompress the blobs.  Decompression is deferred to query time via
+//! [`LazyVectorField::decompress_flat`] / [`LazyVectorField::decompress_graph`].
 
 use std::io::Write;
+use std::ops::Range;
 
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 
-use crate::directory::FileSlice;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::schema::{VectorDistance, VectorOptions};
 use crate::TantivyError;
 
@@ -236,19 +239,37 @@ pub(crate) fn write_vec_file(
 }
 
 // ---------------------------------------------------------------------------
-// Read
+// Lazy read — parse metadata/offsets only, defer decompression to query time
 // ---------------------------------------------------------------------------
 
-/// Loaded bundle: decompressed flat vectors + compact graph ready for search.
-pub(crate) struct LoadedVectorField {
+/// One vector field parsed from the `.vec` file but **not yet decompressed**.
+/// The compressed flat-vector and graph blobs are retained as byte-range
+/// references into the underlying (typically mmap'd) `OwnedBytes`.
+pub(crate) struct LazyVectorField {
     pub field_id: u32,
     pub options: VectorOptions,
     pub num_docs: u32,
-    pub flat: Vec<f32>,
-    pub graph: CompactHnswGraph,
+    pub dimension: usize,
+    raw: OwnedBytes,
+    flat_range: Range<usize>,
+    graph_range: Range<usize>,
 }
 
-pub(crate) fn read_vec_file(data: FileSlice) -> crate::Result<Vec<LoadedVectorField>> {
+impl LazyVectorField {
+    pub(crate) fn decompress_flat(&self) -> crate::Result<Vec<f32>> {
+        let compressed = &self.raw[self.flat_range.clone()];
+        let decompressed = zstd_decompress(compressed)?;
+        le_bytes_to_flat(&decompressed, self.num_docs as usize * self.dimension)
+    }
+
+    pub(crate) fn decompress_graph(&self) -> crate::Result<CompactHnswGraph> {
+        let compressed = &self.raw[self.graph_range.clone()];
+        let decompressed = zstd_decompress(compressed)?;
+        CompactHnswGraph::deserialize(&decompressed)
+    }
+}
+
+pub(crate) fn read_vec_file_lazy(data: FileSlice) -> crate::Result<Vec<LazyVectorField>> {
     let bytes = data.read_bytes()?;
     let buf = bytes.as_slice();
     let mut pos = 0usize;
@@ -278,26 +299,24 @@ pub(crate) fn read_vec_file(data: FileSlice) -> crate::Result<Vec<LoadedVectorFi
         let num_docs = read_u32_le(buf, &mut pos)?;
         let dimension = read_u32_le(buf, &mut pos)? as usize;
 
-        // flat vectors (zstd)
         let flat_clen = read_u64_le(buf, &mut pos)? as usize;
         check_len(buf, pos, flat_clen, "flat compressed")?;
-        let flat_decompressed = zstd_decompress(&buf[pos..pos + flat_clen])?;
+        let flat_range = pos..pos + flat_clen;
         pos += flat_clen;
-        let flat = le_bytes_to_flat(&flat_decompressed, num_docs as usize * dimension)?;
 
-        // graph (zstd)
         let graph_clen = read_u64_le(buf, &mut pos)? as usize;
         check_len(buf, pos, graph_clen, "graph compressed")?;
-        let graph_decompressed = zstd_decompress(&buf[pos..pos + graph_clen])?;
+        let graph_range = pos..pos + graph_clen;
         pos += graph_clen;
-        let graph = CompactHnswGraph::deserialize(&graph_decompressed)?;
 
-        out.push(LoadedVectorField {
+        out.push(LazyVectorField {
             field_id,
             options,
             num_docs,
-            flat,
-            graph,
+            dimension,
+            raw: bytes.clone(),
+            flat_range,
+            graph_range,
         });
     }
     Ok(out)
