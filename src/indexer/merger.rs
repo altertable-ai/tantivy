@@ -475,7 +475,7 @@ impl IndexMerger {
     ) -> crate::Result<()> {
         for (field, field_entry) in self.schema.fields() {
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
-            if field_entry.field_type().get_index_record_option().is_some() {
+            if field_entry.is_indexed() {
                 self.write_postings_for_field(
                     field,
                     field_entry.field_type(),

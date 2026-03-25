@@ -437,6 +437,11 @@ impl QueryParser {
         let field_supports_ff_range_queries = field_type.is_fast()
             && is_type_valid_for_fastfield_range_query(field_type.value_type());
 
+        if matches!(field_type, FieldType::Vector(_)) {
+            return Err(QueryParserError::UnsupportedQuery(
+                "Vector fields are searched with KnnQuery, not the query parser".to_string(),
+            ));
+        }
         if !field_type.is_indexed() && !field_supports_ff_range_queries {
             return Err(QueryParserError::FieldNotIndexed(
                 field_entry.name().to_string(),
@@ -541,6 +546,11 @@ impl QueryParser {
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let field_name = field_entry.name();
+        if matches!(field_type, FieldType::Vector(_)) {
+            return Err(QueryParserError::UnsupportedQuery(
+                "Vector fields are searched with KnnQuery, not the query parser".to_string(),
+            ));
+        }
         if !field_type.is_indexed() {
             return Err(QueryParserError::FieldNotIndexed(field_name.to_string()));
         }

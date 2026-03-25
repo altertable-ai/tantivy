@@ -261,7 +261,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.is_indexed(),
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_indexed(),
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_indexed(),
-            FieldType::Vector(ref opts) => opts.is_indexed(),
+            FieldType::Vector(_) => false,
         }
     }
 
