@@ -99,7 +99,12 @@ pub struct VectorFieldReader {
 #[cfg(not(feature = "vector"))]
 impl VectorFieldReader {
     /// Approximate k-nearest neighbors for `query` (always empty without feature).
-    pub fn search(&self, _query: &[f32], _k: usize, _ef: usize) -> crate::Result<Vec<(DocId, Score)>> {
+    pub fn search(
+        &self,
+        _query: &[f32],
+        _k: usize,
+        _ef: usize,
+    ) -> crate::Result<Vec<(DocId, Score)>> {
         Ok(Vec::new())
     }
 

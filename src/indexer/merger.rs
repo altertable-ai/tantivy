@@ -552,14 +552,16 @@ impl IndexMerger {
 
             let mut flat: Vec<f32> = Vec::with_capacity(self.max_doc as usize * dim);
             for old_addr in doc_id_mapping.iter_old_doc_addrs() {
-                let seg_flat = segment_flats[old_addr.segment_ord as usize].as_ref().ok_or_else(|| {
-                    crate::TantivyError::DataCorruption(
-                        crate::error::DataCorruption::comment_only(format!(
-                            "Missing vector reader for field {:?} during merge",
-                            field_entry.name()
-                        )),
-                    )
-                })?;
+                let seg_flat = segment_flats[old_addr.segment_ord as usize]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::TantivyError::DataCorruption(
+                            crate::error::DataCorruption::comment_only(format!(
+                                "Missing vector reader for field {:?} during merge",
+                                field_entry.name()
+                            )),
+                        )
+                    })?;
                 let start = old_addr.doc_id as usize * dim;
                 let end = start + dim;
                 if end > seg_flat.len() {
