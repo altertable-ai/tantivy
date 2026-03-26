@@ -6,10 +6,8 @@
 //!
 //! **Brute-force ground truth** uses the **original full-precision `f32` embeddings** from
 //! [`load_fixture_vectors`] (the wiki fixture bytes), **not** the HNSW graph and **not** any
-//! lossy representation. After indexing + merge, we assert `flat_vectors()` equals that same
-//! matrix so the on-disk layout (today: lossless zstd `f32`) still matches the originals; when
-//! you add quantization, keep a parallel `Vec<Vec<f32>>` built **before** quantizing and use it
-//! here for the oracle while [`KnnQuery`] still exercises the serialized index.
+//! lossy representation. After indexing + merge, dequantized rows from the index are checked
+//! against a per-dimension tolerance derived from SQ8 scales (not bit-exact).
 //!
 //! **Note:** With `harness = false`, `benches/vector_wiki.rs` is not built as a test target, so
 //! quality checks live here instead of inside the Criterion bench file.
@@ -48,10 +46,7 @@ fn brute_force_top_k_ids(query: &[f32], corpus: &[Vec<f32>], k: usize) -> Vec<u3
         .enumerate()
         .map(|(i, v)| (cosine_distance(query, v), i as u32))
         .collect();
-    scored.sort_by(|a, b| {
-        a.0.total_cmp(&b.0)
-            .then_with(|| a.1.cmp(&b.1))
-    });
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     scored.into_iter().take(k).map(|(_, id)| id).collect()
 }
 
@@ -75,10 +70,7 @@ fn load_fixture_vectors() -> Vec<Vec<f32>> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    floats
-        .chunks(EMBEDDING_DIM)
-        .map(|c| c.to_vec())
-        .collect()
+    floats.chunks(EMBEDDING_DIM).map(|c| c.to_vec()).collect()
 }
 
 fn schema_and_field() -> (Schema, tantivy::schema::Field) {
@@ -105,7 +97,8 @@ fn build_wiki_index() -> tantivy::Result<(Index, tantivy::schema::Field)> {
         w.wait_merging_threads()?;
     }
     // Large commits can flush to multiple segments; merge once so we have one segment and
-    // brute-force baselines use the same contiguous `flat_vectors()` table as HNSW (see merge tests).
+    // brute-force baselines use the same contiguous `flat_vectors()` table as HNSW (see merge
+    // tests).
     {
         let mut w = index.writer_with_num_threads::<TantivyDocument>(1, 100_000_000)?;
         let mut seg_ids = index.searchable_segment_ids()?;
@@ -119,8 +112,7 @@ fn build_wiki_index() -> tantivy::Result<(Index, tantivy::schema::Field)> {
     Ok((index, field))
 }
 
-/// Decompressed `f32` flat from the vector index file (used only to verify lossless round-trip
-/// vs the fixture before quantization changes the format).
+/// Dequantized `f32` flat from the vector index (SQ8 round-trip).
 fn corpus_rows_from_reader(
     field: tantivy::schema::Field,
     index: &Index,
@@ -150,6 +142,11 @@ fn corpus_rows_from_reader(
         .collect())
 }
 
+/// Worst-case per-dimension error for scalar quantization with bin width `scale` (uniform bins).
+fn max_sq8_dim_error(scale: f32) -> f32 {
+    scale * 0.5 + 1e-5
+}
+
 /// One test builds the index once to avoid running two heavy indexes in parallel (default
 /// `cargo test` runs `#[test]` fns concurrently), which was flaky under `--all-features`.
 #[test]
@@ -157,11 +154,6 @@ fn wiki_knn_quality_against_brute_force_fixture() -> tantivy::Result<()> {
     let original_fixture = load_fixture_vectors();
     let (index, field) = build_wiki_index()?;
     let rows = corpus_rows_from_reader(field, &index)?;
-    assert_eq!(
-        rows, original_fixture,
-        "merged segment row order must match fixture insertion order so brute-force can use \
-         original f32 embeddings (not re-read from disk) indexed by DocId"
-    );
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let seg = searcher.segment_reader(0);
@@ -169,14 +161,30 @@ fn wiki_knn_quality_against_brute_force_fixture() -> tantivy::Result<()> {
         .vector_readers()
         .get(field)
         .expect("vector field reader");
+    let (_mins, scales) = vread.quantization_params();
+
+    // Row order matches insertion order (DocId); values are within SQ8 error of the fixture.
+    assert_eq!(rows.len(), original_fixture.len());
+    for (doc_idx, (row, orig_row)) in rows.iter().zip(original_fixture.iter()).enumerate() {
+        for d in 0..EMBEDDING_DIM {
+            let err = (row[d] - orig_row[d]).abs();
+            assert!(
+                err <= max_sq8_dim_error(scales[d]),
+                "doc {doc_idx} dim {d}: dequant error {err} exceeds bound (scale={})",
+                scales[d]
+            );
+        }
+    }
 
     for qi in [0usize, 42, 256, 500, 999] {
         let v = vread.vector(qi as u32)?.expect("vector");
-        assert_eq!(
-            v,
-            original_fixture[qi],
-            "vector(doc) must match original fixture row (lossless round-trip before quantization)"
-        );
+        for d in 0..EMBEDDING_DIM {
+            let err = (v[d] - original_fixture[qi][d]).abs();
+            assert!(
+                err <= max_sq8_dim_error(scales[d]),
+                "vector({qi}) dim {d}: dequant error {err}"
+            );
+        }
     }
 
     let k = 10usize;
@@ -193,8 +201,8 @@ fn wiki_knn_quality_against_brute_force_fixture() -> tantivy::Result<()> {
         let recall = recall_at_k(&truth, &retrieved);
         assert!(
             recall >= 0.85,
-            "query index {qi}: recall@{k} was {recall} (expected >= 0.85). \
-             truth={truth:?} retrieved={retrieved:?}",
+            "query index {qi}: recall@{k} was {recall} (expected >= 0.85). truth={truth:?} \
+             retrieved={retrieved:?}",
         );
     }
     Ok(())

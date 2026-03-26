@@ -1,15 +1,8 @@
 //! On-disk layout for the `.vec` segment file.
 //!
-//! **V2 format** (magic `TNVYVEC2`): compact graph + zstd-compressed flat vectors.
-//!
-//! Layout per field:
-//!   field_id (u32 LE), options JSON (len-prefixed), num_docs (u32 LE), dimension (u32 LE),
-//!   zstd-compressed flat vectors (len-prefixed u64 LE blob),
-//!   zstd-compressed compact HNSW graph (len-prefixed u64 LE blob).
-//!
-//! Reading is **lazy**: [`read_vec_file_lazy`] parses the header/offsets but does
-//! *not* decompress the blobs.  Decompression is deferred to query time via
-//! [`LazyVectorField::decompress_flat`] / [`LazyVectorField::decompress_graph`].
+//! **V3 format** (magic `TNVYVEC3`): per-dimension scalar quantization (SQ8) + mmap-friendly
+//! flat `u8` vectors + uncompressed compact HNSW graph. No zstd. Older formats are not
+//! supported.
 
 use std::io::Write;
 use std::ops::Range;
@@ -20,10 +13,8 @@ use crate::directory::{FileSlice, OwnedBytes};
 use crate::schema::{VectorDistance, VectorOptions};
 use crate::TantivyError;
 
-pub(crate) const MAGIC: &[u8; 8] = b"TNVYVEC2";
-const VERSION: u32 = 2;
-
-const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+pub(crate) const MAGIC: &[u8; 8] = b"TNVYVEC3";
+const VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Compact HNSW graph
@@ -31,14 +22,6 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 /// In-memory HNSW graph for search.  Stores only topology (neighbor IDs), not
 /// vectors or distances — those are recomputed from the flat store at query time.
-///
-/// The adjacency data lives in three contiguous vectors instead of
-/// `Vec<Vec<Vec<u32>>>`, avoiding O(N × layers) small heap allocations:
-///
-/// * `layer_counts[point]` — how many layers this point participates in.
-/// * `adj_offsets[point]`  — index into `adj_data` where this point's packed neighbor lists begin.
-/// * `adj_data`            — packed sequences of `[count_u32, id, id, …]` for each layer of each
-///   point (layer 0 first, then layer 1, …).
 pub(crate) struct CompactHnswGraph {
     pub entry_point: u32,
     pub entry_layer: u8,
@@ -49,8 +32,6 @@ pub(crate) struct CompactHnswGraph {
 }
 
 impl CompactHnswGraph {
-    /// Build from per-point adjacency lists (convenience for the hnsw_rs extraction
-    /// path which naturally produces `Vec<Vec<Vec<u32>>>`).
     pub(crate) fn new(
         entry_point: u32,
         entry_layer: u8,
@@ -85,8 +66,6 @@ impl CompactHnswGraph {
         }
     }
 
-    /// Neighbor IDs for `point` at `layer`.  O(layer) scan over the packed
-    /// counts, but layers are almost always 0 (rarely > 1), so effectively O(1).
     #[inline]
     pub(crate) fn neighbors(&self, point: u32, layer: usize) -> &[u32] {
         let idx = point as usize;
@@ -106,16 +85,6 @@ impl CompactHnswGraph {
         &self.adj_data[off + 1..off + 1 + count]
     }
 
-    /// Serialize to a byte buffer (before zstd compression).
-    ///
-    /// Wire format:
-    /// ```text
-    /// entry_point: u32 LE
-    /// entry_layer: u8
-    /// num_points:  u32 LE
-    /// layer_counts: [u8; num_points]
-    /// per point, per layer: num_neighbors u16 LE, [neighbor_id u32 LE; ...]
-    /// ```
     pub(crate) fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.entry_point.to_le_bytes());
@@ -141,7 +110,6 @@ impl CompactHnswGraph {
         buf
     }
 
-    /// Deserialize from the raw (decompressed) byte buffer.
     pub(crate) fn deserialize(buf: &[u8]) -> crate::Result<Self> {
         let mut pos = 0usize;
         let entry_point = read_u32_le(buf, &mut pos)?;
@@ -188,10 +156,113 @@ impl CompactHnswGraph {
 }
 
 // ---------------------------------------------------------------------------
-// V2 bundle written during indexing / merge
+// SQ8 quantization (shared by writer, reader, merger)
 // ---------------------------------------------------------------------------
 
-/// Payload for one vector field going into the `.vec` file.
+/// Per-dimension min/max over all rows in `flat` (row-major, `num_docs * dim` floats).
+pub(crate) fn compute_sq8_params(
+    num_docs: usize,
+    dim: usize,
+    flat: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(flat.len(), num_docs * dim);
+    let mut mins = vec![f32::INFINITY; dim];
+    let mut maxs = vec![f32::NEG_INFINITY; dim];
+    for row in 0..num_docs {
+        let base = row * dim;
+        for d in 0..dim {
+            let v = flat[base + d];
+            mins[d] = mins[d].min(v);
+            maxs[d] = maxs[d].max(v);
+        }
+    }
+    let scales: Vec<f32> = mins
+        .iter()
+        .zip(maxs.iter())
+        .map(
+            |(&min, &max)| {
+                if max > min {
+                    (max - min) / 255.0
+                } else {
+                    0.0
+                }
+            },
+        )
+        .collect();
+    (mins, scales)
+}
+
+/// Quantize row-major `f32` flat to `u8` using `mins` / `scales` from [`compute_sq8_params`].
+pub(crate) fn quantize_flat_to_u8(
+    flat: &[f32],
+    dim: usize,
+    mins: &[f32],
+    scales: &[f32],
+) -> Vec<u8> {
+    assert_eq!(mins.len(), dim);
+    assert_eq!(scales.len(), dim);
+    let n = flat.len() / dim;
+    let mut out = vec![0u8; flat.len()];
+    for row in 0..n {
+        let base = row * dim;
+        for d in 0..dim {
+            let v = flat[base + d];
+            let min = mins[d];
+            let scale = scales[d];
+            out[base + d] = if scale > 0.0 {
+                ((v - min) / scale).round().clamp(0.0, 255.0) as u8
+            } else {
+                0
+            };
+        }
+    }
+    out
+}
+
+/// Dequantize one row (`dim` bytes) into `out` (length `dim`).
+pub(crate) fn dequantize_row_into(row: &[u8], mins: &[f32], scales: &[f32], out: &mut [f32]) {
+    let dim = row.len();
+    debug_assert_eq!(mins.len(), dim);
+    debug_assert_eq!(scales.len(), dim);
+    debug_assert_eq!(out.len(), dim);
+    for d in 0..dim {
+        out[d] = mins[d] + row[d] as f32 * scales[d];
+    }
+}
+
+/// Dequantize full flat `u8` to `f32` row-major.
+pub(crate) fn dequantize_flat_u8_to_f32(
+    flat_u8: &[u8],
+    num_docs: usize,
+    dim: usize,
+    mins: &[f32],
+    scales: &[f32],
+) -> crate::Result<Vec<f32>> {
+    if flat_u8.len() != num_docs * dim {
+        return Err(corruption(format!(
+            "quantized flat size mismatch: {} bytes for {} docs x {}",
+            flat_u8.len(),
+            num_docs,
+            dim
+        )));
+    }
+    let mut out = vec![0f32; num_docs * dim];
+    for row in 0..num_docs {
+        let base = row * dim;
+        dequantize_row_into(
+            &flat_u8[base..base + dim],
+            mins,
+            scales,
+            &mut out[base..base + dim],
+        );
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Bundle written during indexing / merge
+// ---------------------------------------------------------------------------
+
 pub(crate) struct VectorFieldBundle {
     pub field_id: u32,
     pub options: VectorOptions,
@@ -199,10 +270,6 @@ pub(crate) struct VectorFieldBundle {
     pub flat: Vec<f32>,
     pub graph: CompactHnswGraph,
 }
-
-// ---------------------------------------------------------------------------
-// Write
-// ---------------------------------------------------------------------------
 
 pub(crate) fn write_vec_file(
     writer: &mut dyn Write,
@@ -220,52 +287,79 @@ pub(crate) fn write_vec_file(
         writer.write_u32::<LittleEndian>(opts_json.len() as u32)?;
         writer.write_all(&opts_json)?;
 
+        let num_docs = bundle.num_docs as usize;
+        let dim = bundle.options.dimension;
         writer.write_u32::<LittleEndian>(bundle.num_docs)?;
-        writer.write_u32::<LittleEndian>(bundle.options.dimension as u32)?;
+        writer.write_u32::<LittleEndian>(dim as u32)?;
 
-        // --- flat vectors: zstd-compressed ---
-        let flat_bytes = flat_to_le_bytes(&bundle.flat);
-        let flat_compressed = zstd_compress(&flat_bytes)?;
-        writer.write_u64::<LittleEndian>(flat_compressed.len() as u64)?;
-        writer.write_all(&flat_compressed)?;
+        let (mins, scales) = compute_sq8_params(num_docs, dim, &bundle.flat);
+        for &m in &mins {
+            writer.write_f32::<LittleEndian>(m)?;
+        }
+        for &s in &scales {
+            writer.write_f32::<LittleEndian>(s)?;
+        }
 
-        // --- compact graph: zstd-compressed ---
+        let quantized = quantize_flat_to_u8(&bundle.flat, dim, &mins, &scales);
+        writer.write_all(&quantized)?;
+
         let graph_raw = bundle.graph.serialize();
-        let graph_compressed = zstd_compress(&graph_raw)?;
-        writer.write_u64::<LittleEndian>(graph_compressed.len() as u64)?;
-        writer.write_all(&graph_compressed)?;
+        writer.write_u64::<LittleEndian>(graph_raw.len() as u64)?;
+        writer.write_all(&graph_raw)?;
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Lazy read — parse metadata/offsets only, defer decompression to query time
+// Lazy read — mmap-friendly: only metadata ranges; vectors stay as bytes in `OwnedBytes`.
 // ---------------------------------------------------------------------------
 
-/// One vector field parsed from the `.vec` file but **not yet decompressed**.
-/// The compressed flat-vector and graph blobs are retained as byte-range
-/// references into the underlying (typically mmap'd) `OwnedBytes`.
 pub(crate) struct LazyVectorField {
     pub field_id: u32,
     pub options: VectorOptions,
     pub num_docs: u32,
     pub dimension: usize,
     raw: OwnedBytes,
-    flat_range: Range<usize>,
+    mins_range: Range<usize>,
+    scales_range: Range<usize>,
+    vectors_range: Range<usize>,
     graph_range: Range<usize>,
 }
 
 impl LazyVectorField {
-    pub(crate) fn decompress_flat(&self) -> crate::Result<Vec<f32>> {
-        let compressed = &self.raw[self.flat_range.clone()];
-        let decompressed = zstd_decompress(compressed)?;
-        le_bytes_to_flat(&decompressed, self.num_docs as usize * self.dimension)
+    pub(crate) fn mins_bytes(&self) -> &[u8] {
+        &self.raw[self.mins_range.clone()]
     }
 
-    pub(crate) fn decompress_graph(&self) -> crate::Result<CompactHnswGraph> {
-        let compressed = &self.raw[self.graph_range.clone()];
-        let decompressed = zstd_decompress(compressed)?;
-        CompactHnswGraph::deserialize(&decompressed)
+    pub(crate) fn scales_bytes(&self) -> &[u8] {
+        &self.raw[self.scales_range.clone()]
+    }
+
+    pub(crate) fn quantized_vectors(&self) -> &[u8] {
+        &self.raw[self.vectors_range.clone()]
+    }
+
+    pub(crate) fn parse_mins_scales(&self) -> crate::Result<(Vec<f32>, Vec<f32>)> {
+        let dim = self.dimension;
+        let mins = f32_slice_from_bytes(self.mins_bytes(), dim)?;
+        let scales = f32_slice_from_bytes(self.scales_bytes(), dim)?;
+        Ok((mins, scales))
+    }
+
+    pub(crate) fn parse_graph(&self) -> crate::Result<CompactHnswGraph> {
+        CompactHnswGraph::deserialize(&self.raw[self.graph_range.clone()])
+    }
+
+    /// Full dequantized flat (merge / `flat_vectors` API).
+    pub(crate) fn dequantize_flat(&self) -> crate::Result<Vec<f32>> {
+        let (mins, scales) = self.parse_mins_scales()?;
+        dequantize_flat_u8_to_f32(
+            self.quantized_vectors(),
+            self.num_docs as usize,
+            self.dimension,
+            &mins,
+            &scales,
+        )
     }
 }
 
@@ -277,7 +371,7 @@ pub(crate) fn read_vec_file_lazy(data: FileSlice) -> crate::Result<Vec<LazyVecto
     check_len(buf, 0, 8, "magic")?;
     if &buf[..8] != MAGIC {
         return Err(corruption(format!(
-            "unsupported .vec format (expected TNVYVEC2, got {:?})",
+            "unsupported .vec format (expected TNVYVEC3, got {:?})",
             std::str::from_utf8(&buf[..8]).unwrap_or("???")
         )));
     }
@@ -296,30 +390,53 @@ pub(crate) fn read_vec_file_lazy(data: FileSlice) -> crate::Result<Vec<LazyVecto
             .map_err(|e| corruption(format!("vector options: {e}")))?;
         pos += opt_len;
 
-        let num_docs = read_u32_le(buf, &mut pos)?;
+        let num_docs = read_u32_le(buf, &mut pos)? as usize;
         let dimension = read_u32_le(buf, &mut pos)? as usize;
 
-        let flat_clen = read_u64_le(buf, &mut pos)? as usize;
-        check_len(buf, pos, flat_clen, "flat compressed")?;
-        let flat_range = pos..pos + flat_clen;
-        pos += flat_clen;
+        let mins_len = dimension * 4;
+        check_len(buf, pos, mins_len, "mins")?;
+        let mins_range = pos..pos + mins_len;
+        pos += mins_len;
 
-        let graph_clen = read_u64_le(buf, &mut pos)? as usize;
-        check_len(buf, pos, graph_clen, "graph compressed")?;
-        let graph_range = pos..pos + graph_clen;
-        pos += graph_clen;
+        let scales_len = dimension * 4;
+        check_len(buf, pos, scales_len, "scales")?;
+        let scales_range = pos..pos + scales_len;
+        pos += scales_len;
+
+        let vec_len = num_docs * dimension;
+        check_len(buf, pos, vec_len, "vectors")?;
+        let vectors_range = pos..pos + vec_len;
+        pos += vec_len;
+
+        let graph_len = read_u64_le(buf, &mut pos)? as usize;
+        check_len(buf, pos, graph_len, "graph")?;
+        let graph_range = pos..pos + graph_len;
+        pos += graph_len;
 
         out.push(LazyVectorField {
             field_id,
             options,
-            num_docs,
+            num_docs: num_docs as u32,
             dimension,
             raw: bytes.clone(),
-            flat_range,
+            mins_range,
+            scales_range,
+            vectors_range,
             graph_range,
         });
     }
     Ok(out)
+}
+
+fn f32_slice_from_bytes(bytes: &[u8], dim: usize) -> crate::Result<Vec<f32>> {
+    if bytes.len() != dim * 4 {
+        return Err(corruption("mins/scales length mismatch"));
+    }
+    let mut v = Vec::with_capacity(dim);
+    for chunk in bytes.chunks_exact(4) {
+        v.push(LittleEndian::read_f32(chunk));
+    }
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -369,48 +486,6 @@ fn dist_cosine(a: &[f32], b: &[f32]) -> f32 {
 fn dist_dot(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
     (1.0 - dot).max(0.0)
-}
-
-// ---------------------------------------------------------------------------
-// Compression helpers
-// ---------------------------------------------------------------------------
-
-fn zstd_compress(data: &[u8]) -> crate::Result<Vec<u8>> {
-    zstd::bulk::compress(data, ZSTD_COMPRESSION_LEVEL)
-        .map_err(|e| TantivyError::InternalError(format!("zstd compress: {e}")))
-}
-
-fn zstd_decompress(data: &[u8]) -> crate::Result<Vec<u8>> {
-    // Allow up to 2 GiB decompressed; real payloads are much smaller.
-    zstd::bulk::decompress(data, 2 << 30)
-        .map_err(|e| TantivyError::InternalError(format!("zstd decompress: {e}")))
-}
-
-// ---------------------------------------------------------------------------
-// Byte-level helpers
-// ---------------------------------------------------------------------------
-
-fn flat_to_le_bytes(flat: &[f32]) -> Vec<u8> {
-    let mut out = vec![0u8; flat.len() * 4];
-    for (i, &f) in flat.iter().enumerate() {
-        LittleEndian::write_f32(&mut out[i * 4..(i + 1) * 4], f);
-    }
-    out
-}
-
-fn le_bytes_to_flat(bytes: &[u8], expected_floats: usize) -> crate::Result<Vec<f32>> {
-    if bytes.len() != expected_floats * 4 {
-        return Err(corruption(format!(
-            "flat size mismatch: {} bytes for {} floats",
-            bytes.len(),
-            expected_floats
-        )));
-    }
-    let mut v = Vec::with_capacity(expected_floats);
-    for chunk in bytes.chunks_exact(4) {
-        v.push(LittleEndian::read_f32(chunk));
-    }
-    Ok(v)
 }
 
 fn read_u16_le(buf: &[u8], pos: &mut usize) -> crate::Result<u16> {

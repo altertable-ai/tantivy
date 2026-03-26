@@ -1,7 +1,7 @@
 //! Index and search dense embeddings for [`benches/wiki.json`](wiki.json).
 //!
 //! When you run this bench, stderr includes the serialized **`.vec` segment file** size (HNSW +
-//! compressed vectors) for the configured schema, via [`Searcher::space_usage`].
+//! SQ8-quantized vectors) for the configured schema, via [`Searcher::space_usage`].
 //!
 //! **Artifacts** (committed): `wiki_embedded.f32.bin`, `wiki_embedded.meta.json`.
 //!
@@ -50,11 +50,7 @@ fn wiki_vector_vec_file_bytes() -> ByteCount {
     w.wait_merging_threads().unwrap();
     let reader = index.reader().unwrap();
     let usage = reader.searcher().space_usage().unwrap();
-    usage
-        .segments()
-        .iter()
-        .map(|s| s.vector_index())
-        .sum()
+    usage.segments().iter().map(|s| s.vector_index()).sum()
 }
 
 /// Must match [`wiki_embedded.meta.json`](wiki_embedded.meta.json) and `wiki_embedded.f32.bin`.

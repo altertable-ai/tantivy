@@ -1,15 +1,19 @@
 //! Loads `.vec` segment data and runs k-NN queries.
 //!
-//! Reader open is **instant** — only metadata/offsets are parsed.
-//! Decompression of flat vectors and the HNSW graph happens on each
-//! `search()` / `vector()` / `flat_vectors()` call.
+//! Reader open parses the V3 header and materializes the compact HNSW graph plus
+//! quantization parameters. Quantized vectors stay as a byte slice into the mmap
+//! region; [`VectorFieldReader::search`] uses a scratch buffer only (no full flat
+//! allocation). [`VectorFieldReader::flat_vectors`] and [`VectorFieldReader::vector`]
+//! dequantize on demand for the public retrieval API.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::directory::FileSlice;
 use crate::schema::Field;
-use crate::vector::io::{distance_to_score, read_vec_file_lazy, LazyVectorField};
+use crate::vector::io::{
+    dequantize_row_into, distance_to_score, read_vec_file_lazy, CompactHnswGraph, LazyVectorField,
+};
 use crate::vector::mmaped_hnsw;
 use crate::{DocId, Score};
 
@@ -25,7 +29,7 @@ impl VectorFieldReaders {
         let mut map = HashMap::with_capacity(fields.len());
         for lazy in fields {
             let field_id = lazy.field_id;
-            let reader = VectorFieldReader::new(lazy);
+            let reader = VectorFieldReader::new(lazy)?;
             map.insert(field_id, Arc::new(reader));
         }
         Ok(VectorFieldReaders {
@@ -45,8 +49,7 @@ impl VectorFieldReaders {
     }
 }
 
-/// One vector field backed by compressed on-disk data.
-/// Decompression happens lazily on each query.
+/// One vector field backed by mmap'd SQ8 data and an in-memory compact graph.
 pub struct VectorFieldReader {
     /// Schema field id.
     pub field_id: u32,
@@ -55,28 +58,45 @@ pub struct VectorFieldReader {
     /// Number of documents indexed in this segment.
     pub num_docs: u32,
     lazy: LazyVectorField,
+    graph: CompactHnswGraph,
+    mins: Vec<f32>,
+    scales: Vec<f32>,
 }
 
 impl VectorFieldReader {
-    fn new(lazy: LazyVectorField) -> Self {
-        Self {
+    fn new(lazy: LazyVectorField) -> crate::Result<Self> {
+        let graph = lazy.parse_graph()?;
+        let (mins, scales) = lazy.parse_mins_scales()?;
+        Ok(Self {
             field_id: lazy.field_id,
             options: lazy.options.clone(),
             num_docs: lazy.num_docs,
             lazy,
-        }
+            graph,
+            mins,
+            scales,
+        })
+    }
+
+    /// Row-major quantized vectors (`num_docs * dimension` bytes), mmap-backed.
+    pub fn quantized_vectors(&self) -> &[u8] {
+        self.lazy.quantized_vectors()
+    }
+
+    /// Per-dimension minimum and `(max-min)/255` scale for SQ8 dequantization.
+    pub fn quantization_params(&self) -> (&[f32], &[f32]) {
+        (&self.mins, &self.scales)
     }
 
     /// Approximate k-nearest neighbors for `query` (same dimension as the field).
-    ///
-    /// Decompresses flat vectors + HNSW graph on every call.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> crate::Result<Vec<(DocId, Score)>> {
-        let flat = self.lazy.decompress_flat()?;
-        let graph = self.lazy.decompress_graph()?;
+        let dim = self.options.dimension;
         Ok(mmaped_hnsw::search(
-            &graph,
-            &flat,
-            self.options.dimension,
+            &self.graph,
+            self.lazy.quantized_vectors(),
+            &self.mins,
+            &self.scales,
+            dim,
             self.options.distance,
             query,
             k,
@@ -87,19 +107,22 @@ impl VectorFieldReader {
         .collect())
     }
 
-    /// Decompress and return all flat vectors (row-major, `num_docs * dimension` floats).
+    /// All flat vectors (row-major, `num_docs * dimension` floats), dequantized from SQ8.
     pub fn flat_vectors(&self) -> crate::Result<Vec<f32>> {
-        self.lazy.decompress_flat()
+        self.lazy.dequantize_flat()
     }
 
-    /// Decompress flat vectors and return the slice for a single document.
+    /// Dequantized vector for `doc`, if in range.
     pub fn vector(&self, doc: DocId) -> crate::Result<Option<Vec<f32>>> {
         let dim = self.options.dimension;
         if doc >= self.num_docs {
             return Ok(None);
         }
-        let flat = self.lazy.decompress_flat()?;
+        let flat_u8 = self.lazy.quantized_vectors();
         let start = doc as usize * dim;
-        Ok(flat.get(start..start + dim).map(|s| s.to_vec()))
+        let row = &flat_u8[start..start + dim];
+        let mut out = vec![0f32; dim];
+        dequantize_row_into(row, &self.mins, &self.scales, &mut out);
+        Ok(Some(out))
     }
 }
