@@ -1,37 +1,8 @@
 use crate::collector::TopDocs;
-use crate::directory::FileSlice;
 use crate::error::TantivyError;
 use crate::query::KnnQuery;
 use crate::schema::{Schema, VectorOptions};
-use crate::vector::io::{read_vec_file, write_vec_file, CompactHnswGraph, VectorFieldBundle};
 use crate::{Index, IndexWriter};
-
-#[test]
-fn vec_file_v3_write_read_roundtrip() -> crate::Result<()> {
-    let graph = CompactHnswGraph::new(0, 0, 2, vec![vec![vec![]], vec![vec![]]]);
-    let bundle = VectorFieldBundle {
-        field_id: 7,
-        options: VectorOptions::new(2),
-        num_docs: 2,
-        flat: vec![0.0f32, 0.0, 1.0, 1.0],
-        graph,
-    };
-    let mut buf = Vec::new();
-    write_vec_file(&mut buf, &[bundle])?;
-    let fields = read_vec_file(FileSlice::from(buf))?;
-    assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].field_id, 7);
-    assert_eq!(fields[0].num_docs, 2);
-    assert_eq!(fields[0].dimension, 2);
-    let flat = fields[0]
-        .sq
-        .dequantize_all(fields[0].quantized_bytes.as_slice(), 2, 2);
-    assert_eq!(flat.len(), 4);
-    for (a, b) in flat.iter().zip([0.0f32, 0.0, 1.0, 1.0].iter()) {
-        assert!((a - b).abs() < 1e-3);
-    }
-    Ok(())
-}
 
 #[test]
 fn knn_query_orders_by_similarity() -> crate::Result<()> {
@@ -91,7 +62,7 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
     let mut best_doc = 0u32;
     let mut best_sq = f32::INFINITY;
     for d in 0..seg_reader.num_docs() {
-        let v = vread.vector(d).expect("vector").expect("vector row");
+        let v = vread.vector(d).expect("decompress").expect("vector row");
         let sq: f32 = v
             .iter()
             .zip(query.iter())

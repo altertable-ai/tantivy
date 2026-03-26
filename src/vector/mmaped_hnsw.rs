@@ -1,4 +1,4 @@
-//! HNSW search directly on the compact graph + distance closure.
+//! HNSW search directly on the compact graph + flat vectors.
 //!
 //! Replaces the previous approach of dumping to temp files and reloading through
 //! `hnsw_rs::hnswio::HnswIo`.  The search algorithm is the standard HNSW greedy
@@ -7,7 +7,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::vector::io::CompactHnswGraph;
+use crate::schema::VectorDistance;
+use crate::vector::io::{distance_fn_for, CompactHnswGraph};
 
 /// Wrapper returned by [`search`] — same fields as the old `hnsw_rs::prelude::Neighbour`
 /// so the reader can convert to `(DocId, Score)` unchanged.
@@ -17,12 +18,12 @@ pub(crate) struct SearchResult {
 }
 
 /// Run an approximate k-NN search on the compact HNSW graph.
-///
-/// `distance_to(id)` returns the distance from the query to the vector at `id`.
-/// The caller supplies storage (e.g. mmap'd quantized bytes + dequantize buffer).
 pub(crate) fn search(
     graph: &CompactHnswGraph,
-    distance_to: &mut impl FnMut(u32) -> f32,
+    flat: &[f32],
+    dim: usize,
+    dist: VectorDistance,
+    query: &[f32],
     k: usize,
     ef: usize,
 ) -> Vec<SearchResult> {
@@ -30,15 +31,21 @@ pub(crate) fn search(
         return Vec::new();
     }
 
+    let distance = distance_fn_for(dist);
+    let get_vec = |id: u32| -> &[f32] {
+        let start = id as usize * dim;
+        &flat[start..start + dim]
+    };
+
     let mut current = graph.entry_point;
-    let mut current_dist = distance_to(current);
+    let mut current_dist = distance(query, get_vec(current));
 
     // Greedy descent: layers entry_layer → 1  (skip layer 0 — that gets the beam search).
     for layer in (1..=graph.entry_layer as usize).rev() {
         loop {
             let mut improved = false;
             for &neighbor in graph.neighbors(current, layer) {
-                let d = distance_to(neighbor);
+                let d = distance(query, get_vec(neighbor));
                 if d < current_dist {
                     current = neighbor;
                     current_dist = d;
@@ -71,7 +78,7 @@ pub(crate) fn search(
             if !visited.mark(neighbor) {
                 continue; // already visited
             }
-            let d = distance_to(neighbor);
+            let d = distance(query, get_vec(neighbor));
             let worst = results.peek().map_or(f32::INFINITY, |r| r.0);
             if d < worst || results.len() < ef_actual {
                 candidates.push(Reverse(DistId(d, neighbor)));

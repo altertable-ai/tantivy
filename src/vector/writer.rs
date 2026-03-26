@@ -1,5 +1,5 @@
 //! Collects per-document vectors during segment indexing and serializes the compact
-//! HNSW graph + scalar-quantized vectors into the `.vec` file (V3 format).
+//! HNSW graph + zstd-compressed flat vectors into the `.vec` file (V2 format).
 
 use std::io::Write;
 

@@ -130,7 +130,7 @@ default = [
     "stemmer",
     "vector",
 ]
-vector = ["dep:hnsw_rs", "dep:anndists"]
+vector = ["dep:hnsw_rs", "dep:anndists", "dep:zstd"]
 stemmer = ["rust-stemmers"]
 mmap = ["fs4", "dep:tempfile", "memmap2"]
 stopwords = []
