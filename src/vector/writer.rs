@@ -20,10 +20,7 @@ pub(crate) struct VectorFieldsWriter {
 struct PerVectorFieldWriter {
     field: Field,
     options: VectorOptions,
-    /// Row-major contiguous buffer: `flat[doc * dim .. (doc+1) * dim]`.
-    flat: Vec<f32>,
-    /// One bit per doc slot to detect gaps (docs that were never added).
-    populated: Vec<bool>,
+    vectors: Vec<Option<Vec<f32>>>,
 }
 
 impl VectorFieldsWriter {
@@ -36,8 +33,7 @@ impl VectorFieldsWriter {
                 per_field[field.field_id() as usize] = Some(PerVectorFieldWriter {
                     field,
                     options: opts.clone(),
-                    flat: Vec::new(),
-                    populated: Vec::new(),
+                    vectors: Vec::new(),
                 });
             }
         }
@@ -65,22 +61,18 @@ impl VectorFieldsWriter {
                             field.field_id()
                         ))
                     })?;
-                let dim = writer.options.dimension;
-                if slice.len() != dim {
+                if slice.len() != writer.options.dimension {
                     return Err(TantivyError::InvalidArgument(format!(
                         "Vector dimension mismatch for field: expected {}, got {}",
-                        dim,
+                        writer.options.dimension,
                         slice.len()
                     )));
                 }
                 let doc_idx = doc_id as usize;
-                if doc_idx >= writer.populated.len() {
-                    writer.flat.resize((doc_idx + 1) * dim, 0.0);
-                    writer.populated.resize(doc_idx + 1, false);
+                if doc_idx >= writer.vectors.len() {
+                    writer.vectors.resize(doc_idx + 1, None);
                 }
-                let offset = doc_idx * dim;
-                writer.flat[offset..offset + dim].copy_from_slice(slice);
-                writer.populated[doc_idx] = true;
+                writer.vectors[doc_idx] = Some(slice.to_vec());
             }
         }
         Ok(())
@@ -90,38 +82,44 @@ impl VectorFieldsWriter {
         self.per_field
             .iter()
             .filter_map(|w| w.as_ref())
-            .map(|w| w.flat.capacity() * std::mem::size_of::<f32>())
+            .map(|w| {
+                w.vectors
+                    .iter()
+                    .filter_map(|v| v.as_ref())
+                    .map(|v| v.capacity() * std::mem::size_of::<f32>())
+                    .sum::<usize>()
+            })
             .sum()
     }
 
-    pub(crate) fn serialize(self, mut writer: WritePtr, max_doc: DocId) -> crate::Result<()> {
+    pub(crate) fn serialize(&self, mut writer: WritePtr, max_doc: DocId) -> crate::Result<()> {
         let mut bundles: Vec<VectorFieldBundle> = Vec::new();
-        for slot in self.per_field {
-            let Some(mut field_writer) = slot else {
+        for slot in &self.per_field {
+            let Some(field_writer) = slot else {
                 continue;
             };
-            let dim = field_writer.options.dimension;
+            let mut flat: Vec<f32> =
+                Vec::with_capacity(max_doc as usize * field_writer.options.dimension);
             for doc in 0..max_doc {
-                if !field_writer
-                    .populated
+                let Some(vec) = field_writer
+                    .vectors
                     .get(doc as usize)
-                    .copied()
-                    .unwrap_or(false)
-                {
+                    .and_then(|v| v.as_ref())
+                else {
                     return Err(TantivyError::InvalidArgument(format!(
                         "Missing vector for doc {doc} in field {:?}",
                         field_writer.field
                     )));
-                }
+                };
+                flat.extend_from_slice(vec);
             }
-            field_writer.flat.truncate(max_doc as usize * dim);
-            let graph =
-                extract_compact_graph(&field_writer.options, max_doc, &field_writer.flat)?;
+
+            let graph = extract_compact_graph(&field_writer.options, max_doc, &flat)?;
             bundles.push(VectorFieldBundle {
                 field_id: field_writer.field.field_id(),
-                options: field_writer.options,
+                options: field_writer.options.clone(),
                 num_docs: max_doc,
-                flat: field_writer.flat,
+                flat,
                 graph,
             });
         }

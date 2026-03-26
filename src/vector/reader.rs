@@ -105,17 +105,6 @@ impl VectorFieldReader {
         ))
     }
 
-    /// Dequantize one document's vector directly into a caller-provided buffer,
-    /// avoiding per-doc heap allocation. `buf` must have length == dimension.
-    #[inline]
-    pub(crate) fn dequantize_doc_into(&self, doc: DocId, buf: &mut [f32]) {
-        debug_assert_eq!(buf.len(), self.dim);
-        debug_assert!((doc as usize) < self.num_docs as usize);
-        let start = doc as usize * self.dim;
-        self.sq
-            .dequantize_into(&self.quantized_bytes[start..start + self.dim], buf);
-    }
-
     /// Dequantized vector for `doc` in this segment, if in range.
     pub fn vector(&self, doc: DocId) -> crate::Result<Option<Vec<f32>>> {
         let dim = self.dim;

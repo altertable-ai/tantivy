@@ -141,7 +141,7 @@ impl VectorFieldsWriter {
         0
     }
 
-    pub(crate) fn serialize(self, _writer: WritePtr, _max_doc: DocId) -> crate::Result<()> {
+    pub(crate) fn serialize(&self, _writer: WritePtr, _max_doc: DocId) -> crate::Result<()> {
         Ok(())
     }
 }

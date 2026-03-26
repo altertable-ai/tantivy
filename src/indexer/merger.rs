@@ -537,15 +537,22 @@ impl IndexMerger {
             };
             let dim = options.dimension;
 
-            let readers: Vec<Option<std::sync::Arc<crate::vector::VectorFieldReader>>> = self
+            // Pre-decompress flat vectors for each segment to avoid per-doc decompression.
+            let segment_flats: Vec<Option<Vec<f32>>> = self
                 .readers
                 .iter()
-                .map(|r| r.vector_readers().get(field))
-                .collect();
+                .map(|reader| {
+                    reader
+                        .vector_readers()
+                        .get(field)
+                        .map(|vfr| vfr.flat_vectors())
+                        .transpose()
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
 
-            let mut flat: Vec<f32> = vec![0f32; self.max_doc as usize * dim];
-            for (new_doc, old_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
-                let vfr = readers[old_addr.segment_ord as usize]
+            let mut flat: Vec<f32> = Vec::with_capacity(self.max_doc as usize * dim);
+            for old_addr in doc_id_mapping.iter_old_doc_addrs() {
+                let seg_flat = segment_flats[old_addr.segment_ord as usize]
                     .as_ref()
                     .ok_or_else(|| {
                         crate::TantivyError::DataCorruption(
@@ -555,7 +562,9 @@ impl IndexMerger {
                             )),
                         )
                     })?;
-                if old_addr.doc_id >= vfr.num_docs {
+                let start = old_addr.doc_id as usize * dim;
+                let end = start + dim;
+                if end > seg_flat.len() {
                     return Err(crate::TantivyError::DataCorruption(
                         crate::error::DataCorruption::comment_only(format!(
                             "Missing vector for field {:?} during merge (doc {:?})",
@@ -564,8 +573,7 @@ impl IndexMerger {
                         )),
                     ));
                 }
-                let offset = new_doc * dim;
-                vfr.dequantize_doc_into(old_addr.doc_id, &mut flat[offset..offset + dim]);
+                flat.extend_from_slice(&seg_flat[start..end]);
             }
             let graph = build_compact_graph_from_flat(options, self.max_doc, &flat)?;
             bundles.push(VectorFieldBundle {

@@ -111,9 +111,7 @@ impl CompactHnswGraph {
     /// per point, per layer: num_neighbors u16 LE, [neighbor_id u32 LE; ...]
     /// ```
     pub(crate) fn serialize(&self) -> Vec<u8> {
-        let header = 4 + 1 + 4 + self.num_points as usize;
-        let adj_upper = self.adj_data.len() * 4;
-        let mut buf = Vec::with_capacity(header + adj_upper);
+        let mut buf = Vec::new();
         buf.extend_from_slice(&self.entry_point.to_le_bytes());
         buf.push(self.entry_layer);
         buf.extend_from_slice(&self.num_points.to_le_bytes());
@@ -332,11 +330,10 @@ pub(crate) fn write_vec_file(
 }
 
 fn write_f32_slice(writer: &mut dyn Write, slice: &[f32]) -> io::Result<()> {
-    let mut buf = vec![0u8; slice.len() * 4];
-    for (i, &f) in slice.iter().enumerate() {
-        buf[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+    for &f in slice {
+        writer.write_all(&f.to_le_bytes())?;
     }
-    writer.write_all(&buf)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
