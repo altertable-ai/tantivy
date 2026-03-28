@@ -21,19 +21,17 @@ use tantivy::query::KnnQuery;
 use tantivy::schema::{Schema, VectorDistance, VectorOptions};
 use tantivy::{doc, Index, IndexWriter, TantivyDocument};
 
-/// Same cosine distance as [`tantivy::vector::io`] (1 − cosine similarity, clamped to ≥ 0).
+/// Same cosine distance as [`tantivy::vector::io`] (1 − cosine similarity on normalized vectors).
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f64;
-    let mut na = 0.0f64;
-    let mut nb = 0.0f64;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let (xd, yd) = (x as f64, y as f64);
-        dot += xd * yd;
-        na += xd * xd;
-        nb += yd * yd;
-    }
-    if na > 0.0 && nb > 0.0 {
-        (1.0 - dot / (na * nb).sqrt()).max(0.0) as f32
+    let norm_a: f32 = a.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    if norm_a > 0.0 && norm_b > 0.0 {
+        let dot: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x / norm_a) * (y / norm_b))
+            .sum();
+        (1.0 - dot).max(0.0)
     } else {
         0.0
     }

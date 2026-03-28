@@ -9,7 +9,7 @@ use crate::directory::WritePtr;
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
 use crate::vector::hnsw::extract_compact_graph;
-use crate::vector::io::{write_vec_file, VectorFieldBundle};
+use crate::vector::io::{normalize_flat_for_cosine, write_vec_file, VectorFieldBundle};
 use crate::{DocId, TantivyError};
 
 /// Collects dense vectors for all vector fields in a segment.
@@ -113,6 +113,12 @@ impl VectorFieldsWriter {
                 };
                 flat.extend_from_slice(vec);
             }
+
+            normalize_flat_for_cosine(
+                &mut flat,
+                field_writer.options.dimension,
+                field_writer.options.distance,
+            );
 
             let graph = extract_compact_graph(&field_writer.options, max_doc, &flat)?;
             bundles.push(VectorFieldBundle {

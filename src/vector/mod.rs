@@ -14,7 +14,7 @@ pub(crate) mod reader;
 pub(crate) mod writer;
 
 #[cfg(feature = "vector")]
-pub(crate) use io::{write_vec_file, VectorFieldBundle};
+pub(crate) use io::{normalize_flat_for_cosine, write_vec_file, VectorFieldBundle};
 #[cfg(feature = "vector")]
 pub use reader::{VectorFieldReader, VectorFieldReaders};
 #[cfg(feature = "vector")]
@@ -62,6 +62,14 @@ pub(crate) fn build_compact_graph_from_flat(
     _flat: &[f32],
 ) -> crate::Result<CompactHnswGraph> {
     Ok(CompactHnswGraph)
+}
+
+#[cfg(not(feature = "vector"))]
+pub(crate) fn normalize_flat_for_cosine(
+    _flat: &mut [f32],
+    _dim: usize,
+    _dist: crate::schema::VectorDistance,
+) {
 }
 
 #[cfg(not(feature = "vector"))]

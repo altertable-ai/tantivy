@@ -1,6 +1,11 @@
 //! Build `hnsw_rs` graphs in memory for serialization. After building, the graph
 //! topology is extracted into [`CompactHnswGraph`] via public iterators — no
 //! `file_dump` needed.
+//!
+//! Distance during graph construction uses `anndists::DistL2` / `DistDot` with the crates'
+//! `stdsimd` feature (portable SIMD `f32`), not the scalar `f64` path used by `DistCosine`.
+//! Cosine-indexed fields pass L2-normalized vectors and [`DistDot`] so indexing matches the
+//! `f32` search path in [`crate::vector::io`].
 
 use hnsw_rs::prelude::*;
 use rayon::current_num_threads;
@@ -67,20 +72,7 @@ pub(crate) fn extract_compact_graph(
             );
             graph_from_hnsw(&h, n)
         }
-        VectorDistance::Cosine => {
-            let h = build_hnsw::<DistCosine>(
-                options,
-                max_elements,
-                max_layer,
-                n,
-                dim,
-                flat,
-                &insert_slices_opt,
-                DistCosine {},
-            );
-            graph_from_hnsw(&h, n)
-        }
-        VectorDistance::DotProduct => {
+        VectorDistance::Cosine | VectorDistance::DotProduct => {
             let h = build_hnsw::<DistDot>(
                 options,
                 max_elements,

@@ -182,9 +182,9 @@ pub(crate) fn compute_sq8_params(
         .map(
             |(&min, &max)| {
                 if max > min {
-                    (max - min) / 255.0
+                    (max - min) / 255.0f32
                 } else {
-                    0.0
+                    0.0f32
                 }
             },
         )
@@ -209,8 +209,8 @@ pub(crate) fn quantize_flat_to_u8(
             let v = flat[base + d];
             let min = mins[d];
             let scale = scales[d];
-            out[base + d] = if scale > 0.0 {
-                ((v - min) / scale).round().clamp(0.0, 255.0) as u8
+            out[base + d] = if scale > 0.0f32 {
+                ((v - min) / scale).round().clamp(0.0f32, 255.0f32) as u8
             } else {
                 0
             };
@@ -220,13 +220,17 @@ pub(crate) fn quantize_flat_to_u8(
 }
 
 /// Dequantize one row (`dim` bytes) into `out` (length `dim`).
+///
+/// Stays in `f32` end-to-end so LLVM can emit 4-wide NEON on AArch64 (no `f64` promotion).
+#[inline]
 pub(crate) fn dequantize_row_into(row: &[u8], mins: &[f32], scales: &[f32], out: &mut [f32]) {
     let dim = row.len();
     debug_assert_eq!(mins.len(), dim);
     debug_assert_eq!(scales.len(), dim);
     debug_assert_eq!(out.len(), dim);
     for d in 0..dim {
-        out[d] = mins[d] + row[d] as f32 * scales[d];
+        let q = row[d] as f32;
+        out[d] = mins[d] + q * scales[d];
     }
 }
 
@@ -257,6 +261,38 @@ pub(crate) fn dequantize_flat_u8_to_f32(
         );
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// L2 normalization (cosine → dot-product conversion)
+// ---------------------------------------------------------------------------
+
+/// In-place L2-normalize a single vector. Zero-norm vectors are left untouched.
+///
+/// Uses plain `f32` accumulation (no `f64`) so the normalize path vectorizes at full NEON width.
+#[inline]
+pub(crate) fn l2_normalize(v: &mut [f32]) {
+    let mut norm_sq = 0.0f32;
+    for i in 0..v.len() {
+        let x = v[i];
+        norm_sq += x * x;
+    }
+    if norm_sq > 0.0f32 {
+        let inv = 1.0f32 / norm_sq.sqrt();
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
+/// Normalize every row of a row-major flat buffer in-place for Cosine fields.
+pub(crate) fn normalize_flat_for_cosine(flat: &mut [f32], dim: usize, dist: VectorDistance) {
+    if dist != VectorDistance::Cosine {
+        return;
+    }
+    for row in flat.chunks_exact_mut(dim) {
+        l2_normalize(row);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -442,50 +478,43 @@ fn f32_slice_from_bytes(bytes: &[u8], dim: usize) -> crate::Result<Vec<f32>> {
 // ---------------------------------------------------------------------------
 // Distance helpers (used by the search module)
 // ---------------------------------------------------------------------------
+//
+// All distance math here is intentionally `f32` only. Untyped float literals like `1.0` / `0.0`
+// infer as `f64` in some Rust type contexts and can force `f64` NEON (2-wide) instead of `f32`
+// (4-wide) on AArch64. Use `*_f32` suffixes and indexed loops so LLVM stays on scalar `f32` SIMD.
 
 pub(crate) fn distance_to_score(distance: f32) -> crate::Score {
-    1.0 / (1.0 + distance)
+    1.0f32 / (1.0f32 + distance)
 }
 
 pub(crate) fn distance_fn_for(dist: VectorDistance) -> fn(&[f32], &[f32]) -> f32 {
     match dist {
         VectorDistance::Euclidean => dist_l2,
-        VectorDistance::Cosine => dist_cosine,
-        VectorDistance::DotProduct => dist_dot,
+        VectorDistance::Cosine | VectorDistance::DotProduct => dist_dot,
     }
 }
 
+/// Squared Euclidean distance, then `sqrt`, all `f32` (no `f64` promotion in the hot loop).
+#[inline]
 fn dist_l2(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum::<f32>()
-        .sqrt()
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = 0.0f32;
+    for i in 0..a.len() {
+        let d = a[i] - b[i];
+        acc += d * d;
+    }
+    acc.sqrt()
 }
 
-fn dist_cosine(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f64;
-    let mut na = 0.0f64;
-    let mut nb = 0.0f64;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let (xd, yd) = (x as f64, y as f64);
-        dot += xd * yd;
-        na += xd * xd;
-        nb += yd * yd;
-    }
-    if na > 0.0 && nb > 0.0 {
-        (1.0 - dot / (na * nb).sqrt()).max(0.0) as f32
-    } else {
-        0.0
-    }
-}
-
+/// Dot-product distance on L2-normalized vectors: `(1 - a·b).max(0)`, all `f32`.
+#[inline]
 fn dist_dot(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
-    (1.0 - dot).max(0.0)
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+    }
+    (1.0f32 - dot).max(0.0f32)
 }
 
 fn read_u16_le(buf: &[u8], pos: &mut usize) -> crate::Result<u16> {

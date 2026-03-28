@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::directory::FileSlice;
-use crate::schema::Field;
+use crate::schema::{Field, VectorDistance};
 use crate::vector::io::{
-    dequantize_row_into, distance_to_score, read_vec_file_lazy, CompactHnswGraph, LazyVectorField,
+    dequantize_row_into, distance_to_score, l2_normalize, read_vec_file_lazy, CompactHnswGraph,
+    LazyVectorField,
 };
 use crate::vector::mmaped_hnsw;
 use crate::{DocId, Score};
@@ -91,6 +92,13 @@ impl VectorFieldReader {
     /// Approximate k-nearest neighbors for `query` (same dimension as the field).
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> crate::Result<Vec<(DocId, Score)>> {
         let dim = self.options.dimension;
+        let query = if self.options.distance == VectorDistance::Cosine {
+            let mut q = query.to_vec();
+            l2_normalize(&mut q);
+            q
+        } else {
+            query.to_vec()
+        };
         Ok(mmaped_hnsw::search(
             &self.graph,
             self.lazy.quantized_vectors(),
@@ -98,7 +106,7 @@ impl VectorFieldReader {
             &self.scales,
             dim,
             self.options.distance,
-            query,
+            &query,
             k,
             ef,
         )
