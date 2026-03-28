@@ -179,15 +179,13 @@ pub(crate) fn compute_sq8_params(
     let scales: Vec<f32> = mins
         .iter()
         .zip(maxs.iter())
-        .map(
-            |(&min, &max)| {
-                if max > min {
-                    (max - min) / 255.0f32
-                } else {
-                    0.0f32
-                }
-            },
-        )
+        .map(|(&min, &max)| {
+            if max > min {
+                (max - min) / 255.0f32
+            } else {
+                0.0f32
+            }
+        })
         .collect();
     (mins, scales)
 }
