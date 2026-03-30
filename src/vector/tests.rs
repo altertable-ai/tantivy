@@ -28,22 +28,25 @@ fn knn_query_orders_by_similarity() -> crate::Result<()> {
 #[test]
 fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
-    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(2));
+    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(3));
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema);
     {
         let mut writer: IndexWriter = index.writer(15_000_000)?;
-        writer.add_document(doc!(emb => vec![1.0f32, 0.0]))?;
+        writer.add_document(doc!(emb => vec![1.0f32, 0.0, 0.0]))?;
+        writer.add_document(doc!(emb => vec![0.9f32, 0.1, 0.0]))?;
+        writer.add_document(doc!(emb => vec![0.8f32, 0.2, 0.0]))?;
         writer.commit()?;
     }
     {
         let mut writer: IndexWriter = index.writer(15_000_000)?;
-        writer.add_document(doc!(emb => vec![0.0f32, 1.0]))?;
+        writer.add_document(doc!(emb => vec![0.0f32, 1.0, 0.0]))?;
+        writer.add_document(doc!(emb => vec![0.0f32, 0.9, 0.1]))?;
+        writer.add_document(doc!(emb => vec![0.0f32, 0.8, 0.2]))?;
         writer.commit()?;
     }
     {
         let mut writer: IndexWriter = index.writer(15_000_000)?;
-        // Deterministic merge order (API order of segment ids can vary between runs).
         let mut seg_ids = index.searchable_segment_ids()?;
         seg_ids.sort();
         writer.merge(&seg_ids).wait()?;
@@ -57,8 +60,7 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
         .vector_readers()
         .get(emb)
         .expect("merged segment should load vector index");
-    let query = [0.0f32, 1.0];
-    // Brute-force nearest doc id (squared L2); independent of merge stacking order.
+    let query = [0.0f32, 1.0, 0.0];
     let mut best_doc = 0u32;
     let mut best_sq = f32::INFINITY;
     for d in 0..seg_reader.num_docs() {
@@ -73,7 +75,6 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
             best_doc = d;
         }
     }
-    // High ef reduces approximate-search variance on tiny graphs.
     let knn = KnnQuery::new(emb, query.to_vec(), 1).with_ef_search(512);
     let top_docs = searcher.search(&knn, &TopDocs::with_limit(1).order_by_score())?;
     assert_eq!(top_docs.len(), 1);

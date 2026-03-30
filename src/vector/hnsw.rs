@@ -106,6 +106,7 @@ fn build_hnsw<'a, D: Distance<f32> + Send + Sync>(
         options.ef_construction,
         dist,
     );
+    h.set_keeping_pruned(true);
     if n > 0 {
         if let Some(ref slices) = insert_slices_opt {
             h.parallel_insert_slice(slices);
