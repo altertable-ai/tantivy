@@ -59,42 +59,52 @@ jobs:
 
     strategy:
       matrix:
+        toolchain:
+          - stable
+          - nightly
         features:
           - { label: "all", flags: "mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer,vector" }
           - { label: "quickwit", flags: "mmap,quickwit,failpoints" }
           - { label: "none", flags: "" }
 
-    name: test-${{ matrix.features.label}}
+    name: test-${{ matrix.toolchain }}-${{ matrix.features.label}}
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install nightly
+    - name: Install toolchain
       uses: actions-rs/toolchain@v1
       with:
-            toolchain: nightly
+            toolchain: ${{ matrix.toolchain }}
             profile: minimal
             override: true
 
     - uses: taiki-e/install-action@nextest
     - uses: Swatinem/rust-cache@v2
 
+    - name: Resolve feature flags
+      id: features
+      run: |
+        FLAGS="${{ matrix.features.flags }}"
+        if [[ "${{ matrix.toolchain }}" == "nightly" && "$FLAGS" == *"vector"* ]]; then
+          FLAGS="${FLAGS},vector-simd"
+        fi
+        echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
     - name: Run tests
       run: |
-        # if matrix.feature.flags is empty then run on --lib to avoid compiling examples
-        # (as most of them rely on mmap) otherwise run all
-        if [ -z "${{ matrix.features.flags }}" ]; then
-          cargo +nightly nextest run --lib --no-default-features --verbose --workspace
+        FLAGS="${{ steps.features.outputs.flags }}"
+        if [ -z "$FLAGS" ]; then
+          cargo nextest run --lib --no-default-features --verbose --workspace
         else
-          cargo +nightly nextest run --features ${{ matrix.features.flags }} --no-default-features --verbose --workspace
+          cargo nextest run --features "$FLAGS" --no-default-features --verbose --workspace
         fi
 
     - name: Run doctests
       run: |
-        # if matrix.feature.flags is empty then run on --lib to avoid compiling examples
-        # (as most of them rely on mmap) otherwise run all
-        if [ -z "${{ matrix.features.flags }}" ]; then
+        FLAGS="${{ steps.features.outputs.flags }}"
+        if [ -z "$FLAGS" ]; then
           echo "no doctest for no feature flag"
         else
-          cargo +nightly test --doc --features ${{ matrix.features.flags }} --verbose --workspace
+          cargo test --doc --features "$FLAGS" --verbose --workspace
         fi
