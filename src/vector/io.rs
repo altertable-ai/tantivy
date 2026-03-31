@@ -219,13 +219,19 @@ pub(crate) fn quantize_flat_to_u8(
 
 /// Dequantize one row (`dim` bytes) into `out` (length `dim`).
 ///
-/// Stays in `f32` end-to-end so LLVM can emit 4-wide NEON on AArch64 (no `f64` promotion).
+/// With `vector-simd`: 8-wide portable SIMD.
+/// Without: scalar `f32` loop (auto-vectorizes to 4-wide NEON on AArch64).
 #[inline]
 pub(crate) fn dequantize_row_into(row: &[u8], mins: &[f32], scales: &[f32], out: &mut [f32]) {
     let dim = row.len();
     debug_assert_eq!(mins.len(), dim);
     debug_assert_eq!(scales.len(), dim);
     debug_assert_eq!(out.len(), dim);
+
+    #[cfg(feature = "vector-simd")]
+    return simd_impl::dequantize_row_into(row, mins, scales, out);
+
+    #[cfg(not(feature = "vector-simd"))]
     for d in 0..dim {
         let q = row[d] as f32;
         out[d] = mins[d] + q * scales[d];
@@ -267,18 +273,25 @@ pub(crate) fn dequantize_flat_u8_to_f32(
 
 /// In-place L2-normalize a single vector. Zero-norm vectors are left untouched.
 ///
-/// Uses plain `f32` accumulation (no `f64`) so the normalize path vectorizes at full NEON width.
+/// With `vector-simd`: 8-wide portable SIMD.
+/// Without: plain `f32` accumulation so the path auto-vectorizes at full NEON width.
 #[inline]
 pub(crate) fn l2_normalize(v: &mut [f32]) {
-    let mut norm_sq = 0.0f32;
-    for i in 0..v.len() {
-        let x = v[i];
-        norm_sq += x * x;
-    }
-    if norm_sq > 0.0f32 {
-        let inv = 1.0f32 / norm_sq.sqrt();
-        for x in v.iter_mut() {
-            *x *= inv;
+    #[cfg(feature = "vector-simd")]
+    return simd_impl::l2_normalize(v);
+
+    #[cfg(not(feature = "vector-simd"))]
+    {
+        let mut norm_sq = 0.0f32;
+        for i in 0..v.len() {
+            let x = v[i];
+            norm_sq += x * x;
+        }
+        if norm_sq > 0.0f32 {
+            let inv = 1.0f32 / norm_sq.sqrt();
+            for x in v.iter_mut() {
+                *x *= inv;
+            }
         }
     }
 }
@@ -474,25 +487,192 @@ fn f32_slice_from_bytes(bytes: &[u8], dim: usize) -> crate::Result<Vec<f32>> {
 }
 
 // ---------------------------------------------------------------------------
+// Portable SIMD acceleration (feature = "vector-simd", requires nightly)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "vector-simd")]
+#[allow(dead_code)]
+mod simd_impl {
+    use std::simd::prelude::*;
+
+    const LANES: usize = 8;
+    type F32x = Simd<f32, LANES>;
+
+    #[inline]
+    pub(super) fn dist_l2(a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        let dim = a.len();
+        let full = dim / LANES;
+        let mut acc = F32x::splat(0.0);
+        for c in 0..full {
+            let i = c * LANES;
+            let d = F32x::from_slice(&a[i..]) - F32x::from_slice(&b[i..]);
+            acc += d * d;
+        }
+        let mut sum = acc.reduce_sum();
+        for i in (full * LANES)..dim {
+            let d = a[i] - b[i];
+            sum += d * d;
+        }
+        sum.sqrt()
+    }
+
+    #[inline]
+    pub(super) fn dist_dot(a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        let dim = a.len();
+        let full = dim / LANES;
+        let mut acc = F32x::splat(0.0);
+        for c in 0..full {
+            let i = c * LANES;
+            acc += F32x::from_slice(&a[i..]) * F32x::from_slice(&b[i..]);
+        }
+        let mut dot = acc.reduce_sum();
+        for i in (full * LANES)..dim {
+            dot += a[i] * b[i];
+        }
+        (1.0f32 - dot).max(0.0f32)
+    }
+
+    #[inline]
+    pub(super) fn l2_normalize(v: &mut [f32]) {
+        let dim = v.len();
+        let full = dim / LANES;
+        let mut acc = F32x::splat(0.0);
+        for c in 0..full {
+            let i = c * LANES;
+            let x = F32x::from_slice(&v[i..]);
+            acc += x * x;
+        }
+        let mut norm_sq = acc.reduce_sum();
+        for i in (full * LANES)..dim {
+            norm_sq += v[i] * v[i];
+        }
+        if norm_sq > 0.0f32 {
+            let inv_scalar = 1.0f32 / norm_sq.sqrt();
+            let inv = F32x::splat(inv_scalar);
+            for c in 0..full {
+                let i = c * LANES;
+                let x = F32x::from_slice(&v[i..]);
+                (x * inv).copy_to_slice(&mut v[i..i + LANES]);
+            }
+            for i in (full * LANES)..dim {
+                v[i] *= inv_scalar;
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn dequantize_row_into(
+        row: &[u8],
+        mins: &[f32],
+        scales: &[f32],
+        out: &mut [f32],
+    ) {
+        let dim = row.len();
+        let full = dim / LANES;
+        for c in 0..full {
+            let i = c * LANES;
+            let q = F32x::from_array(std::array::from_fn(|j| row[i + j] as f32));
+            let m = F32x::from_slice(&mins[i..]);
+            let s = F32x::from_slice(&scales[i..]);
+            (m + q * s).copy_to_slice(&mut out[i..i + LANES]);
+        }
+        for i in (full * LANES)..dim {
+            out[i] = mins[i] + (row[i] as f32) * scales[i];
+        }
+    }
+
+    /// Fused dequantize + L2 distance — keeps dequantized values in SIMD registers,
+    /// never writes to a scratch buffer.
+    #[inline]
+    pub(super) fn dequant_dist_l2(
+        query: &[f32],
+        row: &[u8],
+        mins: &[f32],
+        scales: &[f32],
+    ) -> f32 {
+        let dim = query.len();
+        let full = dim / LANES;
+        let mut acc = F32x::splat(0.0);
+        for c in 0..full {
+            let i = c * LANES;
+            let q = F32x::from_array(std::array::from_fn(|j| row[i + j] as f32));
+            let deq = F32x::from_slice(&mins[i..]) + q * F32x::from_slice(&scales[i..]);
+            let d = F32x::from_slice(&query[i..]) - deq;
+            acc += d * d;
+        }
+        let mut sum = acc.reduce_sum();
+        for i in (full * LANES)..dim {
+            let deq = mins[i] + (row[i] as f32) * scales[i];
+            let d = query[i] - deq;
+            sum += d * d;
+        }
+        sum.sqrt()
+    }
+
+    /// Fused dequantize + dot-product distance.
+    #[inline]
+    pub(super) fn dequant_dist_dot(
+        query: &[f32],
+        row: &[u8],
+        mins: &[f32],
+        scales: &[f32],
+    ) -> f32 {
+        let dim = query.len();
+        let full = dim / LANES;
+        let mut acc = F32x::splat(0.0);
+        for c in 0..full {
+            let i = c * LANES;
+            let q = F32x::from_array(std::array::from_fn(|j| row[i + j] as f32));
+            let deq = F32x::from_slice(&mins[i..]) + q * F32x::from_slice(&scales[i..]);
+            acc += F32x::from_slice(&query[i..]) * deq;
+        }
+        let mut dot = acc.reduce_sum();
+        for i in (full * LANES)..dim {
+            let deq = mins[i] + (row[i] as f32) * scales[i];
+            dot += query[i] * deq;
+        }
+        (1.0f32 - dot).max(0.0f32)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Distance helpers (used by the search module)
 // ---------------------------------------------------------------------------
-//
-// All distance math here is intentionally `f32` only. Untyped float literals like `1.0` / `0.0`
-// infer as `f64` in some Rust type contexts and can force `f64` NEON (2-wide) instead of `f32`
-// (4-wide) on AArch64. Use `*_f32` suffixes and indexed loops so LLVM stays on scalar `f32` SIMD.
 
 pub(crate) fn distance_to_score(distance: f32) -> crate::Score {
     1.0f32 / (1.0f32 + distance)
 }
 
+#[allow(dead_code)]
 pub(crate) fn distance_fn_for(dist: VectorDistance) -> fn(&[f32], &[f32]) -> f32 {
     match dist {
+        #[cfg(feature = "vector-simd")]
+        VectorDistance::Euclidean => simd_impl::dist_l2,
+        #[cfg(not(feature = "vector-simd"))]
         VectorDistance::Euclidean => dist_l2,
+
+        #[cfg(feature = "vector-simd")]
+        VectorDistance::Cosine | VectorDistance::DotProduct => simd_impl::dist_dot,
+        #[cfg(not(feature = "vector-simd"))]
         VectorDistance::Cosine | VectorDistance::DotProduct => dist_dot,
     }
 }
 
-/// Squared Euclidean distance, then `sqrt`, all `f32` (no `f64` promotion in the hot loop).
+/// Fused dequantize-from-SQ8 + distance in one pass (SIMD-accelerated).
+/// Avoids the scratch-buffer round-trip on the search hot path.
+#[cfg(feature = "vector-simd")]
+pub(crate) fn dequant_distance_fn_for(
+    dist: VectorDistance,
+) -> fn(&[f32], &[u8], &[f32], &[f32]) -> f32 {
+    match dist {
+        VectorDistance::Euclidean => simd_impl::dequant_dist_l2,
+        VectorDistance::Cosine | VectorDistance::DotProduct => simd_impl::dequant_dist_dot,
+    }
+}
+
+#[cfg(not(feature = "vector-simd"))]
 #[inline]
 fn dist_l2(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -504,7 +684,7 @@ fn dist_l2(a: &[f32], b: &[f32]) -> f32 {
     acc.sqrt()
 }
 
-/// Dot-product distance on L2-normalized vectors: `(1 - a·b).max(0)`, all `f32`.
+#[cfg(not(feature = "vector-simd"))]
 #[inline]
 fn dist_dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());

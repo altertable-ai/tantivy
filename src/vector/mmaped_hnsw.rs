@@ -8,7 +8,11 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::schema::VectorDistance;
-use crate::vector::io::{dequantize_row_into, distance_fn_for, CompactHnswGraph};
+use crate::vector::io::CompactHnswGraph;
+#[cfg(feature = "vector-simd")]
+use crate::vector::io::dequant_distance_fn_for;
+#[cfg(not(feature = "vector-simd"))]
+use crate::vector::io::{dequantize_row_into, distance_fn_for};
 
 /// Wrapper returned by [`search`] — same fields as the old `hnsw_rs::prelude::Neighbour`
 /// so the reader can convert to `(DocId, Score)` unchanged.
@@ -34,24 +38,38 @@ pub(crate) fn search(
         return Vec::new();
     }
 
+    // With vector-simd: fused dequantize+distance keeps values in SIMD registers,
+    // no scratch buffer needed. Without: two-step dequantize → distance via scratch.
+    #[cfg(feature = "vector-simd")]
+    let dequant_distance = dequant_distance_fn_for(dist);
+    #[cfg(not(feature = "vector-simd"))]
     let distance = distance_fn_for(dist);
+    #[cfg(not(feature = "vector-simd"))]
     let mut scratch = vec![0f32; dim];
 
+    macro_rules! row_distance {
+        ($id:expr) => {{
+            let start = $id as usize * dim;
+            let row = &flat_u8[start..start + dim];
+            #[cfg(feature = "vector-simd")]
+            { dequant_distance(query, row, mins, scales) }
+            #[cfg(not(feature = "vector-simd"))]
+            {
+                dequantize_row_into(row, mins, scales, &mut scratch);
+                distance(query, &scratch)
+            }
+        }};
+    }
+
     let mut current = graph.entry_point;
-    let mut current_dist = {
-        let start = current as usize * dim;
-        dequantize_row_into(&flat_u8[start..start + dim], mins, scales, &mut scratch);
-        distance(query, &scratch)
-    };
+    let mut current_dist = row_distance!(current);
 
     // Greedy descent: layers entry_layer → 1  (skip layer 0 — that gets the beam search).
     for layer in (1..=graph.entry_layer as usize).rev() {
         loop {
             let mut improved = false;
             for &neighbor in graph.neighbors(current, layer) {
-                let start = neighbor as usize * dim;
-                dequantize_row_into(&flat_u8[start..start + dim], mins, scales, &mut scratch);
-                let d = distance(query, &scratch);
+                let d = row_distance!(neighbor);
                 if d < current_dist {
                     current = neighbor;
                     current_dist = d;
@@ -82,17 +100,15 @@ pub(crate) fn search(
 
         for &neighbor in graph.neighbors(c_id, 0) {
             if !visited.mark(neighbor) {
-                continue; // already visited
+                continue;
             }
-            let start = neighbor as usize * dim;
-            dequantize_row_into(&flat_u8[start..start + dim], mins, scales, &mut scratch);
-            let d = distance(query, &scratch);
+            let d = row_distance!(neighbor);
             let worst = results.peek().map_or(f32::INFINITY, |r| r.0);
             if d < worst || results.len() < ef_actual {
                 candidates.push(Reverse(DistId(d, neighbor)));
                 results.push(DistId(d, neighbor));
                 if results.len() > ef_actual {
-                    results.pop(); // remove farthest
+                    results.pop();
                 }
             }
         }

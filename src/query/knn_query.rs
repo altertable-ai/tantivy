@@ -39,7 +39,10 @@ impl KnnQuery {
             field,
             query_vector,
             k,
-            ef_search: 64,
+            // A 2x multiplier on k is a well-established rule of thumb.
+            // Qdrant internally defaults to approximately max(k * 1.5, 64).
+            // The HNSW paper recommends ef >= k with extra headroom for good recall.
+            ef_search: k.max(32) * 2,
         }
     }
 
