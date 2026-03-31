@@ -563,12 +563,7 @@ mod simd_impl {
     }
 
     #[inline]
-    pub(super) fn dequantize_row_into(
-        row: &[u8],
-        mins: &[f32],
-        scales: &[f32],
-        out: &mut [f32],
-    ) {
+    pub(super) fn dequantize_row_into(row: &[u8], mins: &[f32], scales: &[f32], out: &mut [f32]) {
         let dim = row.len();
         let full = dim / LANES;
         for c in 0..full {
@@ -586,12 +581,7 @@ mod simd_impl {
     /// Fused dequantize + L2 distance — keeps dequantized values in SIMD registers,
     /// never writes to a scratch buffer.
     #[inline]
-    pub(super) fn dequant_dist_l2(
-        query: &[f32],
-        row: &[u8],
-        mins: &[f32],
-        scales: &[f32],
-    ) -> f32 {
+    pub(super) fn dequant_dist_l2(query: &[f32], row: &[u8], mins: &[f32], scales: &[f32]) -> f32 {
         let dim = query.len();
         let full = dim / LANES;
         let mut acc = F32x::splat(0.0);
@@ -613,12 +603,7 @@ mod simd_impl {
 
     /// Fused dequantize + dot-product distance.
     #[inline]
-    pub(super) fn dequant_dist_dot(
-        query: &[f32],
-        row: &[u8],
-        mins: &[f32],
-        scales: &[f32],
-    ) -> f32 {
+    pub(super) fn dequant_dist_dot(query: &[f32], row: &[u8], mins: &[f32], scales: &[f32]) -> f32 {
         let dim = query.len();
         let full = dim / LANES;
         let mut acc = F32x::splat(0.0);

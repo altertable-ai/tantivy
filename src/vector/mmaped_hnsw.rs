@@ -8,9 +8,9 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::schema::VectorDistance;
-use crate::vector::io::CompactHnswGraph;
 #[cfg(feature = "vector-simd")]
 use crate::vector::io::dequant_distance_fn_for;
+use crate::vector::io::CompactHnswGraph;
 #[cfg(not(feature = "vector-simd"))]
 use crate::vector::io::{dequantize_row_into, distance_fn_for};
 
@@ -52,7 +52,9 @@ pub(crate) fn search(
             let start = $id as usize * dim;
             let row = &flat_u8[start..start + dim];
             #[cfg(feature = "vector-simd")]
-            { dequant_distance(query, row, mins, scales) }
+            {
+                dequant_distance(query, row, mins, scales)
+            }
             #[cfg(not(feature = "vector-simd"))]
             {
                 dequantize_row_into(row, mins, scales, &mut scratch);
