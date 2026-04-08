@@ -22,11 +22,9 @@ use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
 #[cfg(feature = "vector")]
 use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row, compute_bbq_params};
-#[cfg(feature = "vector")]
-use crate::vector::{
-    build_compact_graph_from_flat, normalize_flat_for_cosine, VectorFieldBundle,
-};
 use crate::vector::write_vec_file;
+#[cfg(feature = "vector")]
+use crate::vector::{build_compact_graph_from_flat, normalize_flat_for_cosine, VectorFieldBundle};
 use crate::{DocAddress, DocId, InvertedIndexReader};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.

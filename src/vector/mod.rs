@@ -61,6 +61,7 @@ pub(crate) fn write_vec_file(
 }
 
 #[cfg(not(feature = "vector"))]
+#[allow(dead_code)] // Merger uses the real implementations only with `feature = "vector"`.
 pub(crate) fn build_compact_graph_from_flat(
     _options: &VectorOptions,
     _max_doc: DocId,
@@ -70,6 +71,7 @@ pub(crate) fn build_compact_graph_from_flat(
 }
 
 #[cfg(not(feature = "vector"))]
+#[allow(dead_code)]
 pub(crate) fn normalize_flat_for_cosine(
     _flat: &mut [f32],
     _dim: usize,
