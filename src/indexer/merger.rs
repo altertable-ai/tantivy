@@ -20,10 +20,13 @@ use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
+#[cfg(feature = "vector")]
 use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row, compute_bbq_params};
+#[cfg(feature = "vector")]
 use crate::vector::{
-    build_compact_graph_from_flat, normalize_flat_for_cosine, write_vec_file, VectorFieldBundle,
+    build_compact_graph_from_flat, normalize_flat_for_cosine, VectorFieldBundle,
 };
+use crate::vector::write_vec_file;
 use crate::{DocAddress, DocId, InvertedIndexReader};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
@@ -525,6 +528,7 @@ impl IndexMerger {
         Ok(())
     }
 
+    #[cfg(feature = "vector")]
     fn write_vector_fields(
         &self,
         serializer: &mut SegmentSerializer,
@@ -605,6 +609,23 @@ impl IndexMerger {
             });
         }
         write_vec_file(&mut vec_write, &bundles)?;
+        vec_write.flush()?;
+        vec_write.terminate()?;
+        Ok(())
+    }
+
+    /// Without the `vector` feature, vector merge is a no-op; the writer is still finalized so
+    /// `SegmentSerializer::close` does not see a dangling vector handle.
+    #[cfg(not(feature = "vector"))]
+    fn write_vector_fields(
+        &self,
+        serializer: &mut SegmentSerializer,
+        _doc_id_mapping: &SegmentDocIdMapping,
+    ) -> crate::Result<()> {
+        let Some(mut vec_write) = serializer.extract_vector_write() else {
+            return Ok(());
+        };
+        write_vec_file(&mut vec_write, &[])?;
         vec_write.flush()?;
         vec_write.terminate()?;
         Ok(())
