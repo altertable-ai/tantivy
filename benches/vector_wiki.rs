@@ -1,7 +1,7 @@
 //! Index and search dense embeddings for [`benches/wiki.json`](wiki.json).
 //!
 //! When you run this bench, stderr includes the serialized **`.vec` segment file** size (HNSW +
-//! SQ8-quantized vectors) for the configured schema, via [`Searcher::space_usage`].
+//! BBQ-packed vectors) for the configured schema, via [`Searcher::space_usage`].
 //!
 //! **Artifacts** (committed): `wiki_embedded.f32.bin`, `wiki_embedded.meta.json`.
 //!

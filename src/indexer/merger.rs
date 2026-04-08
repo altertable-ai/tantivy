@@ -20,6 +20,7 @@ use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
+use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row, compute_bbq_params};
 use crate::vector::{
     build_compact_graph_from_flat, normalize_flat_for_cosine, write_vec_file, VectorFieldBundle,
 };
@@ -539,7 +540,7 @@ impl IndexMerger {
             };
             let dim = options.dimension;
 
-            // Load dequantized flat vectors for each segment (SQ8 → f32) for merge + HNSW rebuild.
+            // Load dequantized flat vectors for each segment (BBQ → f32) for merge + HNSW rebuild.
             let segment_flats: Vec<Option<Vec<f32>>> = self
                 .readers
                 .iter()
@@ -578,12 +579,28 @@ impl IndexMerger {
                 flat.extend_from_slice(&seg_flat[start..end]);
             }
             normalize_flat_for_cosine(&mut flat, dim, options.distance);
+            let (centroid, bbq_bits, bbq_lower, bbq_upper) =
+                compute_bbq_params(&flat, dim, self.max_doc as usize);
+            let bpr = bbq_bytes_per_row(dim);
+            for row in 0..self.max_doc as usize {
+                let bits = &bbq_bits[row * bpr..(row + 1) * bpr];
+                bbq_dequantize_row(
+                    &centroid,
+                    bits,
+                    bbq_lower[row],
+                    bbq_upper[row],
+                    &mut flat[row * dim..(row + 1) * dim],
+                );
+            }
             let graph = build_compact_graph_from_flat(options, self.max_doc, &flat)?;
             bundles.push(VectorFieldBundle {
                 field_id: field.field_id(),
                 options: options.clone(),
                 num_docs: self.max_doc,
-                flat,
+                centroid,
+                bbq_bits,
+                bbq_lower,
+                bbq_upper,
                 graph,
             });
         }

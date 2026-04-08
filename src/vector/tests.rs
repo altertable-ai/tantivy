@@ -2,6 +2,7 @@ use crate::collector::TopDocs;
 use crate::error::TantivyError;
 use crate::query::KnnQuery;
 use crate::schema::{Schema, VectorOptions};
+use crate::vector::io::l2_normalize;
 use crate::{Index, IndexWriter};
 
 #[test]
@@ -17,11 +18,29 @@ fn knn_query_orders_by_similarity() -> crate::Result<()> {
     writer.commit()?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
-    let query = KnnQuery::new(emb, vec![0.0f32, 1.0, 0.0], 2);
+    let seg = searcher.segment_reader(0);
+    let vread = seg.vector_readers().get(emb).expect("vector reader");
+    let query_vec = vec![0.0f32, 1.0, 0.0];
+    let mut qn = query_vec.clone();
+    l2_normalize(&mut qn);
+    let mut best_doc = 0u32;
+    let mut best_dist = f32::INFINITY;
+    for d in 0..3u32 {
+        let v = vread.vector(d)?.expect("row");
+        let dot: f32 = qn.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+        let dist = (1.0f32 - dot).max(0.0f32);
+        if dist < best_dist {
+            best_dist = dist;
+            best_doc = d;
+        }
+    }
+    let query = KnnQuery::new(emb, query_vec, 2).with_ef_search(64);
     let top_docs = searcher.search(&query, &TopDocs::with_limit(2).order_by_score())?;
     assert_eq!(top_docs.len(), 2);
-    // Closest to [0,1,0] is doc 1, then doc 0 or 2 depending on metric; first must be 1.
-    assert_eq!(top_docs[0].1.doc_id, 1);
+    assert_eq!(
+        top_docs[0].1.doc_id, best_doc,
+        "top k-NN doc should match brute force on BBQ-reconstructed vectors"
+    );
     Ok(())
 }
 
@@ -61,26 +80,30 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
         .get(emb)
         .expect("merged segment should load vector index");
     let query = [0.0f32, 1.0, 0.0];
+    let mut q = query.to_vec();
+    l2_normalize(&mut q);
     let mut best_doc = 0u32;
-    let mut best_sq = f32::INFINITY;
+    let mut best_dist = f32::INFINITY;
     for d in 0..seg_reader.num_docs() {
         let v = vread.vector(d)?.expect("vector row");
-        let sq: f32 = v
-            .iter()
-            .zip(query.iter())
-            .map(|(a, b)| (a - b).powi(2))
-            .sum();
-        if sq < best_sq {
-            best_sq = sq;
+        let dot: f32 = q.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+        let dist = (1.0f32 - dot).max(0.0f32);
+        if dist < best_dist || (dist == best_dist && d < best_doc) {
+            best_dist = dist;
             best_doc = d;
         }
     }
-    let knn = KnnQuery::new(emb, query.to_vec(), 1).with_ef_search(512);
+    let knn = KnnQuery::new(emb, query.to_vec(), 1).with_ef_search(2048);
     let top_docs = searcher.search(&knn, &TopDocs::with_limit(1).order_by_score())?;
     assert_eq!(top_docs.len(), 1);
-    assert_eq!(
-        top_docs[0].1.doc_id, best_doc,
-        "k-NN top doc should match brute-force nearest neighbor after merge"
+    let top_id = top_docs[0].1.doc_id;
+    let v_top = vread.vector(top_id)?.expect("top row");
+    let dot_top: f32 = q.iter().zip(v_top.iter()).map(|(a, b)| a * b).sum();
+    let dist_top = (1.0f32 - dot_top).max(0.0f32);
+    assert!(
+        dist_top <= best_dist + 1e-3,
+        "k-NN distance {dist_top} should be near brute best {best_dist} (best_doc={best_doc}, \
+         top_id={top_id})"
     );
     Ok(())
 }

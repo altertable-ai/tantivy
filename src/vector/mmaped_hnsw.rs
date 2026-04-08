@@ -1,18 +1,19 @@
-//! HNSW search directly on the compact graph + scalar-quantized flat vectors.
+//! HNSW search on the compact graph + BBQ-stored vectors.
 //!
-//! Candidate vectors are dequantized row-by-row into a scratch buffer for distance
-//! evaluation (no full flat decompression / allocation on the search path beyond
-//! one `dim`-sized scratch buffer).
+//! The graph is built on BBQ-reconstructed `f32` rows. Search uses **asymmetric** distance
+//! (closed form in [`crate::vector::bbq`]) that matches exact distance on those reconstructions,
+//! without materializing a full `dim`-vector per candidate on the hot path.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::schema::VectorDistance;
-#[cfg(feature = "vector-simd")]
-use crate::vector::io::dequant_distance_fn_for;
-use crate::vector::io::CompactHnswGraph;
-#[cfg(not(feature = "vector-simd"))]
-use crate::vector::io::{dequantize_row_into, distance_fn_for};
+use crate::vector::bbq::{
+    bbq_binary_dots_block, bbq_bytes_per_row, bbq_dequantize_row, bbq_distance, bbq_distance_dot,
+    bbq_distance_l2, bbq_dot_distances_block16, bbq_l2_distances_from_binary_dots, gather_bbq_rows,
+    BbqDotCtx, BbqL2Ctx,
+};
+use crate::vector::io::{distance_fn_for, CompactHnswGraph};
 
 /// Wrapper returned by [`search`] — same fields as the old `hnsw_rs::prelude::Neighbour`
 /// so the reader can convert to `(DocId, Score)` unchanged.
@@ -21,13 +22,17 @@ pub(crate) struct SearchResult {
     pub distance: f32,
 }
 
-/// Run an approximate k-NN search on the compact HNSW graph over SQ8-stored vectors.
+/// Gather + fused block distance pays off when enough neighbors amortize the bit loop.
+const BBQ_BLOCK_MIN_NEIGHBORS: usize = 6;
+
+/// Run approximate k-NN on the compact HNSW graph over BBQ-stored vectors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn search(
     graph: &CompactHnswGraph,
-    flat_u8: &[u8],
-    mins: &[f32],
-    scales: &[f32],
+    bbq_bits: &[u8],
+    bbq_lower: &[f32],
+    bbq_upper: &[f32],
+    centroid: &[f32],
     dim: usize,
     dist: VectorDistance,
     query: &[f32],
@@ -38,40 +43,49 @@ pub(crate) fn search(
         return Vec::new();
     }
 
-    // With vector-simd: fused dequantize+distance keeps values in SIMD registers,
-    // no scratch buffer needed. Without: two-step dequantize → distance via scratch.
-    #[cfg(feature = "vector-simd")]
-    let dequant_distance = dequant_distance_fn_for(dist);
-    #[cfg(not(feature = "vector-simd"))]
-    let distance = distance_fn_for(dist);
-    #[cfg(not(feature = "vector-simd"))]
+    let bpr = bbq_bytes_per_row(dim);
+    let dot_ctx = BbqDotCtx::new(query, centroid);
+    let l2_ctx = BbqL2Ctx::new(query, centroid);
+
+    // Euclidean upper layers still use f32 recon + metric fn (rare visits).
+    let distance_f32 = distance_fn_for(dist);
     let mut scratch = vec![0f32; dim];
 
-    macro_rules! row_distance {
-        ($id:expr) => {{
-            let start = $id as usize * dim;
-            let row = &flat_u8[start..start + dim];
-            #[cfg(feature = "vector-simd")]
-            {
-                dequant_distance(query, row, mins, scales)
+    let mut row_distance = |id: u32| -> f32 {
+        let i = id as usize;
+        let start = i * bpr;
+        match dist {
+            VectorDistance::Euclidean => {
+                bbq_dequantize_row(
+                    centroid,
+                    &bbq_bits[start..start + bpr],
+                    bbq_lower[i],
+                    bbq_upper[i],
+                    &mut scratch,
+                );
+                distance_f32(query, &scratch)
             }
-            #[cfg(not(feature = "vector-simd"))]
-            {
-                dequantize_row_into(row, mins, scales, &mut scratch);
-                distance(query, &scratch)
-            }
-        }};
-    }
+            VectorDistance::Cosine | VectorDistance::DotProduct => bbq_distance(
+                dist,
+                query,
+                &dot_ctx,
+                &l2_ctx,
+                &bbq_bits[start..start + bpr],
+                bbq_lower[i],
+                bbq_upper[i],
+                dim,
+            ),
+        }
+    };
 
     let mut current = graph.entry_point;
-    let mut current_dist = row_distance!(current);
+    let mut current_dist = row_distance(current);
 
-    // Greedy descent: layers entry_layer → 1  (skip layer 0 — that gets the beam search).
     for layer in (1..=graph.entry_layer as usize).rev() {
         loop {
             let mut improved = false;
             for &neighbor in graph.neighbors(current, layer) {
-                let d = row_distance!(neighbor);
+                let d = row_distance(neighbor);
                 if d < current_dist {
                     current = neighbor;
                     current_dist = d;
@@ -84,7 +98,6 @@ pub(crate) fn search(
         }
     }
 
-    // ef-bounded beam search at layer 0.
     let ef_actual = ef.max(k);
     let mut candidates: BinaryHeap<Reverse<DistId>> = BinaryHeap::new();
     let mut results: BinaryHeap<DistId> = BinaryHeap::new();
@@ -94,23 +107,110 @@ pub(crate) fn search(
     candidates.push(Reverse(DistId(current_dist, current)));
     results.push(DistId(current_dist, current));
 
+    let mut gathered = vec![0u8; 16 * bpr];
+    let mut binary_dots = vec![0f32; 16];
+    let mut dist_block = vec![0f32; 16];
+    let mut lowers16 = [0f32; 16];
+    let mut uppers16 = [0f32; 16];
+
     while let Some(Reverse(DistId(c_dist, c_id))) = candidates.pop() {
         let worst = results.peek().map_or(f32::INFINITY, |d| d.0);
         if c_dist > worst && results.len() >= ef_actual {
             break;
         }
 
-        for &neighbor in graph.neighbors(c_id, 0) {
-            if !visited.mark(neighbor) {
-                continue;
+        let neighbors = graph.neighbors(c_id, 0);
+        let mut nbr_batch: Vec<u32> = Vec::with_capacity(neighbors.len());
+        for &nbr in neighbors {
+            if visited.mark(nbr) {
+                nbr_batch.push(nbr);
             }
-            let d = row_distance!(neighbor);
-            let worst = results.peek().map_or(f32::INFINITY, |r| r.0);
-            if d < worst || results.len() < ef_actual {
-                candidates.push(Reverse(DistId(d, neighbor)));
-                results.push(DistId(d, neighbor));
-                if results.len() > ef_actual {
-                    results.pop();
+        }
+
+        for chunk in nbr_batch.chunks(16) {
+            let n = chunk.len();
+
+            if n < BBQ_BLOCK_MIN_NEIGHBORS {
+                for i in 0..n {
+                    let idx = chunk[i] as usize;
+                    let start = idx * bpr;
+                    let row_bits = &bbq_bits[start..start + bpr];
+                    dist_block[i] = match dist {
+                        VectorDistance::Euclidean => {
+                            bbq_distance_l2(&l2_ctx, row_bits, bbq_lower[idx], bbq_upper[idx], dim)
+                        }
+                        VectorDistance::Cosine | VectorDistance::DotProduct => bbq_distance_dot(
+                            &dot_ctx,
+                            query,
+                            row_bits,
+                            bbq_lower[idx],
+                            bbq_upper[idx],
+                            dim,
+                        ),
+                    };
+                }
+            } else {
+                gather_bbq_rows(bbq_bits, bpr, chunk, &mut gathered[..n * bpr]);
+                for i in 0..n {
+                    let idx = chunk[i] as usize;
+                    lowers16[i] = bbq_lower[idx];
+                    uppers16[i] = bbq_upper[idx];
+                }
+                binary_dots[..n].fill(0.0f32);
+
+                match dist {
+                    VectorDistance::Euclidean => {
+                        bbq_binary_dots_block(
+                            &l2_ctx.qc,
+                            dim,
+                            bpr,
+                            &gathered[..n * bpr],
+                            n,
+                            &mut binary_dots,
+                        );
+                        bbq_l2_distances_from_binary_dots(
+                            &l2_ctx,
+                            &lowers16[..n],
+                            &uppers16[..n],
+                            &gathered[..n * bpr],
+                            dim,
+                            bpr,
+                            n,
+                            &binary_dots,
+                            &mut dist_block,
+                        );
+                    }
+                    VectorDistance::Cosine | VectorDistance::DotProduct => {
+                        bbq_binary_dots_block(
+                            query,
+                            dim,
+                            bpr,
+                            &gathered[..n * bpr],
+                            n,
+                            &mut binary_dots,
+                        );
+                        bbq_dot_distances_block16(
+                            &dot_ctx,
+                            &lowers16[..n],
+                            &uppers16[..n],
+                            &binary_dots,
+                            n,
+                            &mut dist_block,
+                        );
+                    }
+                }
+            }
+
+            for i in 0..n {
+                let neighbor = chunk[i];
+                let d = dist_block[i];
+                let worst = results.peek().map_or(f32::INFINITY, |r| r.0);
+                if d < worst || results.len() < ef_actual {
+                    candidates.push(Reverse(DistId(d, neighbor)));
+                    results.push(DistId(d, neighbor));
+                    if results.len() > ef_actual {
+                        results.pop();
+                    }
                 }
             }
         }
@@ -128,11 +228,6 @@ pub(crate) fn search(
     out
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Ordered (distance, id) pair for BinaryHeap. Uses `total_cmp` so NaN is handled.
 #[derive(Clone, Copy, PartialEq)]
 struct DistId(f32, u32);
 
@@ -150,7 +245,6 @@ impl Ord for DistId {
     }
 }
 
-/// Bit-vector for O(1) visited checks instead of a `HashSet`.
 struct VisitedSet {
     bits: Vec<u64>,
 }
@@ -163,7 +257,6 @@ impl VisitedSet {
         }
     }
 
-    /// Mark `id` as visited; returns `true` if it was **not** previously visited.
     #[inline]
     fn mark(&mut self, id: u32) -> bool {
         let word = id as usize / 64;

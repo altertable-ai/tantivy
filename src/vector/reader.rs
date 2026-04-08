@@ -1,19 +1,18 @@
 //! Loads `.vec` segment data and runs k-NN queries.
 //!
-//! Reader open parses the V3 header and materializes the compact HNSW graph plus
-//! quantization parameters. Quantized vectors stay as a byte slice into the mmap
-//! region; [`VectorFieldReader::search`] uses a scratch buffer only (no full flat
-//! allocation). [`VectorFieldReader::flat_vectors`] and [`VectorFieldReader::vector`]
-//! dequantize on demand for the public retrieval API.
+//! Reader open parses the V4 header and materializes the compact HNSW graph plus
+//! field centroid and per-document BBQ lower/upper. Packed bits stay mmap-backed;
+//! [`VectorFieldReader::search`] uses asymmetric BBQ distances. [`VectorFieldReader::flat_vectors`]
+//! and [`VectorFieldReader::vector`] lossily reconstruct f32 rows for merge / retrieval.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::directory::FileSlice;
 use crate::schema::{Field, VectorDistance};
+use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row};
 use crate::vector::io::{
-    dequantize_row_into, distance_to_score, l2_normalize, read_vec_file_lazy, CompactHnswGraph,
-    LazyVectorField,
+    distance_to_score, l2_normalize, read_vec_file_lazy, CompactHnswGraph, LazyVectorField,
 };
 use crate::vector::mmaped_hnsw;
 use crate::{DocId, Score};
@@ -50,7 +49,7 @@ impl VectorFieldReaders {
     }
 }
 
-/// One vector field backed by mmap'd SQ8 data and an in-memory compact graph.
+/// One vector field backed by mmap'd BBQ data and an in-memory compact graph.
 pub struct VectorFieldReader {
     /// Schema field id.
     pub field_id: u32,
@@ -60,33 +59,47 @@ pub struct VectorFieldReader {
     pub num_docs: u32,
     lazy: LazyVectorField,
     graph: CompactHnswGraph,
-    mins: Vec<f32>,
-    scales: Vec<f32>,
+    centroid: Vec<f32>,
+    bbq_lower: Vec<f32>,
+    bbq_upper: Vec<f32>,
 }
 
 impl VectorFieldReader {
     fn new(lazy: LazyVectorField) -> crate::Result<Self> {
         let graph = lazy.parse_graph()?;
-        let (mins, scales) = lazy.parse_mins_scales()?;
+        let centroid = lazy.parse_centroid()?;
+        let bbq_lower = lazy.parse_lowers()?;
+        let bbq_upper = lazy.parse_uppers()?;
         Ok(Self {
             field_id: lazy.field_id,
             options: lazy.options.clone(),
             num_docs: lazy.num_docs,
             lazy,
             graph,
-            mins,
-            scales,
+            centroid,
+            bbq_lower,
+            bbq_upper,
         })
     }
 
-    /// Row-major quantized vectors (`num_docs * dimension` bytes), mmap-backed.
-    pub fn quantized_vectors(&self) -> &[u8] {
-        self.lazy.quantized_vectors()
+    /// Field centroid (component-wise mean), length = dimension.
+    pub fn centroid(&self) -> &[f32] {
+        &self.centroid
     }
 
-    /// Per-dimension minimum and `(max-min)/255` scale for SQ8 dequantization.
-    pub fn quantization_params(&self) -> (&[f32], &[f32]) {
-        (&self.mins, &self.scales)
+    /// Per-document lower residual level after BBQ (length = num_docs).
+    pub fn bbq_lower(&self) -> &[f32] {
+        &self.bbq_lower
+    }
+
+    /// Per-document upper residual level after BBQ (length = num_docs).
+    pub fn bbq_upper(&self) -> &[f32] {
+        &self.bbq_upper
+    }
+
+    /// Packed 1-bit BBQ residuals: `num_docs * ceil(dimension / 8)` bytes, mmap-backed.
+    pub fn bbq_bits(&self) -> &[u8] {
+        self.lazy.bbq_bits_bytes()
     }
 
     /// Approximate k-nearest neighbors for `query` (same dimension as the field).
@@ -101,9 +114,10 @@ impl VectorFieldReader {
         };
         Ok(mmaped_hnsw::search(
             &self.graph,
-            self.lazy.quantized_vectors(),
-            &self.mins,
-            &self.scales,
+            self.lazy.bbq_bits_bytes(),
+            &self.bbq_lower,
+            &self.bbq_upper,
+            &self.centroid,
             dim,
             self.options.distance,
             &query,
@@ -115,22 +129,29 @@ impl VectorFieldReader {
         .collect())
     }
 
-    /// All flat vectors (row-major, `num_docs * dimension` floats), dequantized from SQ8.
+    /// All flat vectors (row-major, `num_docs * dimension` floats), lossy BBQ reconstruction.
     pub fn flat_vectors(&self) -> crate::Result<Vec<f32>> {
         self.lazy.dequantize_flat()
     }
 
-    /// Dequantized vector for `doc`, if in range.
+    /// Lossily reconstructed vector for `doc`, if in range.
     pub fn vector(&self, doc: DocId) -> crate::Result<Option<Vec<f32>>> {
         let dim = self.options.dimension;
         if doc >= self.num_docs {
             return Ok(None);
         }
-        let flat_u8 = self.lazy.quantized_vectors();
-        let start = doc as usize * dim;
-        let row = &flat_u8[start..start + dim];
+        let bpr = bbq_bytes_per_row(dim);
+        let bits_all = self.lazy.bbq_bits_bytes();
+        let start = doc as usize * bpr;
+        let row = &bits_all[start..start + bpr];
         let mut out = vec![0f32; dim];
-        dequantize_row_into(row, &self.mins, &self.scales, &mut out);
+        bbq_dequantize_row(
+            &self.centroid,
+            row,
+            self.bbq_lower[doc as usize],
+            self.bbq_upper[doc as usize],
+            &mut out,
+        );
         Ok(Some(out))
     }
 }

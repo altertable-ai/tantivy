@@ -3,6 +3,8 @@
 //! Enabled by the `vector` crate feature (on by default).
 
 #[cfg(feature = "vector")]
+pub(crate) mod bbq;
+#[cfg(feature = "vector")]
 pub(crate) mod hnsw;
 #[cfg(feature = "vector")]
 mod io;
@@ -43,7 +45,10 @@ pub(crate) struct VectorFieldBundle {
     pub field_id: u32,
     pub options: VectorOptions,
     pub num_docs: u32,
-    pub flat: Vec<f32>,
+    pub centroid: Vec<f32>,
+    pub bbq_bits: Vec<u8>,
+    pub bbq_lower: Vec<f32>,
+    pub bbq_upper: Vec<f32>,
     pub graph: CompactHnswGraph,
 }
 
