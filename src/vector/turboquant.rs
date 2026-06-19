@@ -170,9 +170,7 @@ pub(crate) fn search(
 }
 
 pub(crate) fn build_alive_mask<I>(num_docs: usize, alive_docs: I) -> Vec<u64>
-where
-    I: IntoIterator<Item = DocId>,
-{
+where I: IntoIterator<Item = DocId> {
     let mut mask = vec![0u64; num_docs.div_ceil(64)];
     for doc in alive_docs {
         let doc = doc as usize;
