@@ -5,8 +5,8 @@
 //! storage/compression changes (e.g. quantization) can be checked against a baseline.
 //!
 //! **Brute-force ground truth** for recall uses **lossily reconstructed** rows from
-//! [`VectorFieldReader::flat_vectors`] (BBQ round-trip), so rankings are compared in the same
-//! approximate space as HNSW search (asymmetric BBQ distances target this reconstruction).
+//! [`VectorFieldReader::flat_vectors`], so rankings are compared in the same approximate
+//! TurboQuant space as search.
 //!
 //! **Note:** With `harness = false`, `benches/vector_wiki.rs` is not built as a test target, so
 //! quality checks live here instead of inside the Criterion bench file.
@@ -93,9 +93,8 @@ fn build_wiki_index() -> tantivy::Result<(Index, tantivy::schema::Field)> {
         w.commit()?;
         w.wait_merging_threads()?;
     }
-    // Large commits can flush to multiple segments; merge once so we have one segment and
-    // brute-force baselines use the same contiguous `flat_vectors()` table as HNSW (see merge
-    // tests).
+    // Large commits can flush to multiple segments; merge once so brute-force baselines use the
+    // same contiguous `flat_vectors()` table as search (see merge tests).
     {
         let mut w = index.writer_with_num_threads::<TantivyDocument>(1, 100_000_000)?;
         let mut seg_ids = index.searchable_segment_ids()?;
@@ -109,7 +108,7 @@ fn build_wiki_index() -> tantivy::Result<(Index, tantivy::schema::Field)> {
     Ok((index, field))
 }
 
-/// Lossily reconstructed `f32` flat from the vector index (BBQ).
+/// Lossily reconstructed `f32` flat from the vector index.
 fn corpus_rows_from_reader(
     field: tantivy::schema::Field,
     index: &Index,

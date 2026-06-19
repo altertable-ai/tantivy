@@ -23,7 +23,7 @@ pub enum SegmentComponent {
     /// Accessing a document from the store is relatively slow, as it
     /// requires to decompress the entire block it belongs to.
     Store,
-    /// HNSW vector index (one file may bundle all vector fields).
+    /// Vector index (one file may bundle all vector fields).
     VectorIndex,
     /// Bitset describing which document of the segment is alive.
     /// (It was representing deleted docs but changed to represent alive docs from v0.17)

@@ -21,10 +21,10 @@ use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
 #[cfg(feature = "vector")]
-use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row, compute_bbq_params};
+use crate::vector::turboquant;
 use crate::vector::write_vec_file;
 #[cfg(feature = "vector")]
-use crate::vector::{build_compact_graph_from_flat, normalize_flat_for_cosine, VectorFieldBundle};
+use crate::vector::{normalize_flat_for_cosine, VectorFieldBundle};
 use crate::{DocAddress, DocId, InvertedIndexReader};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
@@ -542,7 +542,7 @@ impl IndexMerger {
             };
             let dim = options.dimension;
 
-            // Load dequantized flat vectors for each segment (BBQ → f32) for merge + HNSW rebuild.
+            // Load dequantized flat vectors for each segment for merge + TurboQuant re-encode.
             let segment_flats: Vec<Option<Vec<f32>>> = self
                 .readers
                 .iter()
@@ -581,29 +581,17 @@ impl IndexMerger {
                 flat.extend_from_slice(&seg_flat[start..end]);
             }
             normalize_flat_for_cosine(&mut flat, dim, options.distance);
-            let (centroid, bbq_bits, bbq_lower, bbq_upper) =
-                compute_bbq_params(&flat, dim, self.max_doc as usize);
-            let bpr = bbq_bytes_per_row(dim);
-            for row in 0..self.max_doc as usize {
-                let bits = &bbq_bits[row * bpr..(row + 1) * bpr];
-                bbq_dequantize_row(
-                    &centroid,
-                    bits,
-                    bbq_lower[row],
-                    bbq_upper[row],
-                    &mut flat[row * dim..(row + 1) * dim],
-                );
-            }
-            let graph = build_compact_graph_from_flat(options, self.max_doc, &flat)?;
+            let encoded = turboquant::encode(options, &flat, self.max_doc as usize)?;
             bundles.push(VectorFieldBundle {
                 field_id: field.field_id(),
                 options: options.clone(),
                 num_docs: self.max_doc,
-                centroid,
-                bbq_bits,
-                bbq_lower,
-                bbq_upper,
-                graph,
+                bit_width: encoded.bit_width,
+                packed_codes: encoded.packed_codes,
+                scales: encoded.scales,
+                tqplus_shift: encoded.tqplus_shift,
+                tqplus_scale: encoded.tqplus_scale,
+                norms: encoded.norms,
             });
         }
         write_vec_file(&mut vec_write, &bundles)?;

@@ -80,7 +80,7 @@ impl FieldEntry {
         Self::new(field_name, FieldType::JsonObject(json_object_options))
     }
 
-    /// Creates a field entry for a dense vector field (HNSW k-NN index).
+    /// Creates a field entry for a dense vector field (k-NN index).
     pub fn new_vector(field_name: String, vector_options: VectorOptions) -> FieldEntry {
         Self::new(field_name, FieldType::Vector(vector_options))
     }

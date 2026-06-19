@@ -1,5 +1,5 @@
-//! Collects per-document vectors during segment indexing and serializes the compact
-//! HNSW graph + BBQ-packed vectors into the `.vec` file (V4 `TNVYVEC4` format).
+//! Collects per-document vectors during segment indexing and serializes TurboQuant
+//! bit-plane codes into the `.vec` file.
 
 use std::io::Write;
 
@@ -8,9 +8,8 @@ use common::TerminatingWrite;
 use crate::directory::WritePtr;
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row, compute_bbq_params};
-use crate::vector::hnsw::extract_compact_graph;
 use crate::vector::io::{normalize_flat_for_cosine, write_vec_file, VectorFieldBundle};
+use crate::vector::turboquant;
 use crate::{DocId, TantivyError};
 
 /// Collects dense vectors for all vector fields in a segment.
@@ -115,37 +114,20 @@ impl VectorFieldsWriter {
                 flat.extend_from_slice(vec);
             }
 
-            normalize_flat_for_cosine(
-                &mut flat,
-                field_writer.options.dimension,
-                field_writer.options.distance,
-            );
-
             let dim = field_writer.options.dimension;
-            let (centroid, bbq_bits, bbq_lower, bbq_upper) =
-                compute_bbq_params(&flat, dim, max_doc as usize);
-            // HNSW topology must match BBQ recon; reuse `flat` to avoid a second full allocation.
-            let bpr = bbq_bytes_per_row(dim);
-            for row in 0..max_doc as usize {
-                let bits = &bbq_bits[row * bpr..(row + 1) * bpr];
-                bbq_dequantize_row(
-                    &centroid,
-                    bits,
-                    bbq_lower[row],
-                    bbq_upper[row],
-                    &mut flat[row * dim..(row + 1) * dim],
-                );
-            }
-            let graph = extract_compact_graph(&field_writer.options, max_doc, &flat)?;
+            normalize_flat_for_cosine(&mut flat, dim, field_writer.options.distance);
+
+            let encoded = turboquant::encode(&field_writer.options, &flat, max_doc as usize)?;
             bundles.push(VectorFieldBundle {
                 field_id: field_writer.field.field_id(),
                 options: field_writer.options.clone(),
                 num_docs: max_doc,
-                centroid,
-                bbq_bits,
-                bbq_lower,
-                bbq_upper,
-                graph,
+                bit_width: encoded.bit_width,
+                packed_codes: encoded.packed_codes,
+                scales: encoded.scales,
+                tqplus_shift: encoded.tqplus_shift,
+                tqplus_scale: encoded.tqplus_scale,
+                norms: encoded.norms,
             });
         }
         write_vec_file(&mut writer, &bundles)?;
@@ -153,13 +135,4 @@ impl VectorFieldsWriter {
         writer.terminate()?;
         Ok(())
     }
-}
-
-/// Build a compact HNSW graph from flat vectors (used during merge).
-pub(crate) fn build_compact_graph_from_flat(
-    options: &VectorOptions,
-    max_doc: DocId,
-    flat: &[f32],
-) -> crate::Result<crate::vector::io::CompactHnswGraph> {
-    extract_compact_graph(options, max_doc, flat)
 }

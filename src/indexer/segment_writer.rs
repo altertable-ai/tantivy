@@ -345,7 +345,7 @@ impl SegmentWriter {
                     }
                 }
                 FieldType::Vector(_) => {
-                    // Vectors are indexed via the HNSW graph in `.vec`, not the inverted index.
+                    // Vectors are indexed via the `.vec` vector component, not the inverted index.
                 }
             }
         }

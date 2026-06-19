@@ -1,17 +1,13 @@
-//! Dense vector fields and HNSW approximate nearest neighbor search.
+//! Dense vector fields and TurboQuant nearest neighbor search.
 //!
 //! Enabled by the `vector` crate feature (on by default).
 
 #[cfg(feature = "vector")]
-pub(crate) mod bbq;
-#[cfg(feature = "vector")]
-pub(crate) mod hnsw;
-#[cfg(feature = "vector")]
 mod io;
 #[cfg(feature = "vector")]
-mod mmaped_hnsw;
-#[cfg(feature = "vector")]
 pub(crate) mod reader;
+#[cfg(feature = "vector")]
+pub(crate) mod turboquant;
 #[cfg(feature = "vector")]
 pub(crate) mod writer;
 
@@ -20,7 +16,7 @@ pub(crate) use io::{normalize_flat_for_cosine, write_vec_file, VectorFieldBundle
 #[cfg(feature = "vector")]
 pub use reader::{VectorFieldReader, VectorFieldReaders};
 #[cfg(feature = "vector")]
-pub(crate) use writer::{build_compact_graph_from_flat, VectorFieldsWriter};
+pub(crate) use writer::VectorFieldsWriter;
 
 #[cfg(all(test, feature = "vector"))]
 mod tests;
@@ -31,13 +27,11 @@ use std::sync::Arc;
 #[cfg(not(feature = "vector"))]
 use crate::directory::{FileSlice, WritePtr};
 #[cfg(not(feature = "vector"))]
+use crate::fastfield::AliveBitSet;
+#[cfg(not(feature = "vector"))]
 use crate::schema::{document::Document, Field, VectorOptions};
 #[cfg(not(feature = "vector"))]
 use crate::{DocId, Score};
-
-#[cfg(not(feature = "vector"))]
-#[derive(Default)]
-pub(crate) struct CompactHnswGraph;
 
 #[cfg(not(feature = "vector"))]
 #[allow(dead_code)]
@@ -45,11 +39,6 @@ pub(crate) struct VectorFieldBundle {
     pub field_id: u32,
     pub options: VectorOptions,
     pub num_docs: u32,
-    pub centroid: Vec<f32>,
-    pub bbq_bits: Vec<u8>,
-    pub bbq_lower: Vec<f32>,
-    pub bbq_upper: Vec<f32>,
-    pub graph: CompactHnswGraph,
 }
 
 #[cfg(not(feature = "vector"))]
@@ -58,16 +47,6 @@ pub(crate) fn write_vec_file(
     _fields: &[VectorFieldBundle],
 ) -> crate::Result<()> {
     Ok(())
-}
-
-#[cfg(not(feature = "vector"))]
-#[allow(dead_code)] // Merger uses the real implementations only with `feature = "vector"`.
-pub(crate) fn build_compact_graph_from_flat(
-    _options: &VectorOptions,
-    _max_doc: DocId,
-    _flat: &[f32],
-) -> crate::Result<CompactHnswGraph> {
-    Ok(CompactHnswGraph)
 }
 
 #[cfg(not(feature = "vector"))]
@@ -119,6 +98,7 @@ impl VectorFieldReader {
         _query: &[f32],
         _k: usize,
         _ef: usize,
+        _alive: Option<&AliveBitSet>,
     ) -> crate::Result<Vec<(DocId, Score)>> {
         Ok(Vec::new())
     }

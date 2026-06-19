@@ -1,4 +1,4 @@
-//! Approximate k-nearest neighbor query over a dense vector field (HNSW).
+//! Approximate k-nearest neighbor query over a dense vector field.
 
 use std::fmt;
 
@@ -9,7 +9,7 @@ use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, TantivyError};
 
-/// k-nearest neighbor search against a [`crate::schema::Field`] of type vector (HNSW index).
+/// k-nearest neighbor search against a [`crate::schema::Field`] of type vector.
 ///
 /// Scores are derived from the distance metric (higher is more similar).
 #[derive(Clone)]
@@ -39,14 +39,14 @@ impl KnnQuery {
             field,
             query_vector,
             k,
-            // A 2x multiplier on k is a well-established rule of thumb.
-            // Qdrant internally defaults to approximately max(k * 1.5, 64).
-            // The HNSW paper recommends ef >= k with extra headroom for good recall.
+            // Kept for API compatibility; TurboQuant flat-scan search ignores this parameter.
             ef_search: k.max(32) * 2,
         }
     }
 
-    /// Sets HNSW `ef` search parameter (higher = better recall, slower).
+    /// Sets the historical graph-search `ef` parameter.
+    ///
+    /// TurboQuant flat-scan search ignores this parameter.
     pub fn with_ef_search(mut self, ef_search: usize) -> Self {
         self.ef_search = ef_search;
         self
@@ -102,10 +102,12 @@ impl Weight for KnnWeight {
                 dim
             )));
         }
-        let mut hits = vector_reader.search(&self.query_vector, self.k, self.ef_search)?;
-        if let Some(alive) = reader.alive_bitset() {
-            hits.retain(|(doc, _)| alive.is_alive(*doc));
-        }
+        let mut hits = vector_reader.search(
+            &self.query_vector,
+            self.k,
+            self.ef_search,
+            reader.alive_bitset(),
+        )?;
         hits.sort_by_key(|(d, _)| *d);
         let docs: Vec<DocId> = hits.iter().map(|(d, _)| *d).collect();
         let scores: Vec<Score> = hits.iter().map(|(_, s)| *s * boost).collect();

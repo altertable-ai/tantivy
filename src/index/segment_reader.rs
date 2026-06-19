@@ -98,7 +98,7 @@ impl SegmentReader {
         &self.fast_fields_readers
     }
 
-    /// Readers for dense vector fields (HNSW index) in this segment.
+    /// Readers for dense vector fields in this segment.
     pub fn vector_readers(&self) -> &VectorFieldReaders {
         &self.vector_readers
     }

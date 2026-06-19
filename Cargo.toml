@@ -77,7 +77,7 @@ futures-util = { version = "0.3.28", optional = true }
 futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
 typetag = "0.2.21"
-hnsw_rs = { version = "0.3.4", optional = true }
+turbovec = { version = "0.8.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -129,8 +129,8 @@ default = [
     "stemmer",
     "vector",
 ]
-vector = ["dep:hnsw_rs"]
-vector-simd = ["vector", "hnsw_rs/stdsimd"]
+vector = ["dep:turbovec"]
+vector-simd = ["vector"]
 stemmer = ["rust-stemmers"]
 mmap = ["fs4", "dep:tempfile", "memmap2"]
 stopwords = []

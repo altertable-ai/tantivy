@@ -195,7 +195,7 @@ pub enum FieldType {
     JsonObject(JsonObjectOptions),
     /// IpAddr field
     IpAddr(IpAddrOptions),
-    /// Dense vector field (HNSW index when `vector` feature is enabled).
+    /// Dense vector field (TurboQuant index when `vector` feature is enabled).
     #[serde(rename = "vector")]
     Vector(VectorOptions),
 }

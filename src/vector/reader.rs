@@ -1,20 +1,16 @@
 //! Loads `.vec` segment data and runs k-NN queries.
 //!
-//! Reader open parses the V4 header and materializes the compact HNSW graph plus
-//! field centroid and per-document BBQ lower/upper. Packed bits stay mmap-backed;
-//! [`VectorFieldReader::search`] uses asymmetric BBQ distances. [`VectorFieldReader::flat_vectors`]
-//! and [`VectorFieldReader::vector`] lossily reconstruct f32 rows for merge / retrieval.
+//! Reader open parses the V5 header and materializes turbovec's blocked search cache.
+//! Persisted bit-plane codes stay mmap-backed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::directory::FileSlice;
+use crate::fastfield::AliveBitSet;
 use crate::schema::{Field, VectorDistance};
-use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row};
-use crate::vector::io::{
-    distance_to_score, l2_normalize, read_vec_file_lazy, CompactHnswGraph, LazyVectorField,
-};
-use crate::vector::mmaped_hnsw;
+use crate::vector::io::{distance_to_score, l2_normalize, read_vec_file_lazy, LazyVectorField};
+use crate::vector::turboquant::{self, TurboQuantCache};
 use crate::{DocId, Score};
 
 /// Readers for all vector fields in a segment.
@@ -58,52 +54,46 @@ pub struct VectorFieldReader {
     /// Number of documents indexed in this segment.
     pub num_docs: u32,
     lazy: LazyVectorField,
-    graph: CompactHnswGraph,
-    centroid: Vec<f32>,
-    bbq_lower: Vec<f32>,
-    bbq_upper: Vec<f32>,
+    bit_width: usize,
+    scales: Vec<f32>,
+    tqplus_shift: Vec<f32>,
+    tqplus_scale: Vec<f32>,
+    cache: TurboQuantCache,
 }
 
 impl VectorFieldReader {
     fn new(lazy: LazyVectorField) -> crate::Result<Self> {
-        let graph = lazy.parse_graph()?;
-        let centroid = lazy.parse_centroid()?;
-        let bbq_lower = lazy.parse_lowers()?;
-        let bbq_upper = lazy.parse_uppers()?;
+        let bit_width = lazy.turbo_bit_width();
+        let cache = turboquant::prepare_cache(
+            bit_width,
+            lazy.dimension,
+            lazy.num_docs as usize,
+            lazy.turbo_packed_codes(),
+        )?;
+        let scales = lazy.parse_turbo_scales()?;
+        let tqplus_shift = lazy.parse_tqplus_shift()?;
+        let tqplus_scale = lazy.parse_tqplus_scale()?;
         Ok(Self {
             field_id: lazy.field_id,
             options: lazy.options.clone(),
             num_docs: lazy.num_docs,
             lazy,
-            graph,
-            centroid,
-            bbq_lower,
-            bbq_upper,
+            bit_width,
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+            cache,
         })
     }
 
-    /// Field centroid (component-wise mean), length = dimension.
-    pub fn centroid(&self) -> &[f32] {
-        &self.centroid
-    }
-
-    /// Per-document lower residual level after BBQ (length = num_docs).
-    pub fn bbq_lower(&self) -> &[f32] {
-        &self.bbq_lower
-    }
-
-    /// Per-document upper residual level after BBQ (length = num_docs).
-    pub fn bbq_upper(&self) -> &[f32] {
-        &self.bbq_upper
-    }
-
-    /// Packed 1-bit BBQ residuals: `num_docs * ceil(dimension / 8)` bytes, mmap-backed.
-    pub fn bbq_bits(&self) -> &[u8] {
-        self.lazy.bbq_bits_bytes()
-    }
-
     /// Approximate k-nearest neighbors for `query` (same dimension as the field).
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> crate::Result<Vec<(DocId, Score)>> {
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        _ef: usize,
+        alive: Option<&AliveBitSet>,
+    ) -> crate::Result<Vec<(DocId, Score)>> {
         let dim = self.options.dimension;
         let query = if self.options.distance == VectorDistance::Cosine {
             let mut q = query.to_vec();
@@ -112,20 +102,25 @@ impl VectorFieldReader {
         } else {
             query.to_vec()
         };
-        Ok(mmaped_hnsw::search(
-            &self.graph,
-            self.lazy.bbq_bits_bytes(),
-            &self.bbq_lower,
-            &self.bbq_upper,
-            &self.centroid,
-            dim,
-            self.options.distance,
+        let mask = alive
+            .map(|alive| turboquant::build_alive_mask(self.num_docs as usize, alive.iter_alive()));
+        Ok(turboquant::search(
             &query,
+            &self.cache,
+            &self.scales,
+            &self.tqplus_shift,
+            &self.tqplus_scale,
+            self.bit_width,
+            dim,
+            self.num_docs as usize,
             k,
-            ef,
-        )
+            mask.as_deref(),
+        )?
         .into_iter()
-        .map(|r| (r.doc_id as DocId, distance_to_score(r.distance)))
+        .map(|(doc, similarity)| {
+            let distance = (1.0f32 - similarity).max(0.0);
+            (doc, distance_to_score(distance))
+        })
         .collect())
     }
 
@@ -140,18 +135,8 @@ impl VectorFieldReader {
         if doc >= self.num_docs {
             return Ok(None);
         }
-        let bpr = bbq_bytes_per_row(dim);
-        let bits_all = self.lazy.bbq_bits_bytes();
-        let start = doc as usize * bpr;
-        let row = &bits_all[start..start + bpr];
-        let mut out = vec![0f32; dim];
-        bbq_dequantize_row(
-            &self.centroid,
-            row,
-            self.bbq_lower[doc as usize],
-            self.bbq_upper[doc as usize],
-            &mut out,
-        );
-        Ok(Some(out))
+        let flat = self.flat_vectors()?;
+        let start = doc as usize * dim;
+        Ok(Some(flat[start..start + dim].to_vec()))
     }
 }

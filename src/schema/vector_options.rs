@@ -7,16 +7,14 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum VectorDistance {
-    /// Cosine distance (1 - cosine similarity), as defined in `anndists`.
+    /// Cosine distance (1 - cosine similarity).
     #[default]
     Cosine,
-    /// Squared L2 (Euclidean) distance.
-    Euclidean,
     /// Dot product distance (for normalized vectors, related to cosine).
     DotProduct,
 }
 
-/// Configuration for a vector field indexed with HNSW.
+/// Configuration for a vector field indexed for k-NN search.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VectorOptions {
     /// Embedding dimension (number of `f32` components per document).
@@ -27,20 +25,13 @@ pub struct VectorOptions {
     /// Store the vector in the doc store for retrieval.
     #[serde(default)]
     pub stored: bool,
-    /// HNSW `ef_construction` parameter (insertion search width).
-    #[serde(default = "default_ef_construction")]
-    pub ef_construction: usize,
-    /// Maximum number of neighbors per layer in the HNSW graph.
-    #[serde(default = "default_max_nb_connection")]
-    pub max_nb_connection: usize,
+    /// TurboQuant bits per coordinate for cosine/dot fields.
+    #[serde(default = "default_vector_bit_width")]
+    pub bit_width: usize,
 }
 
-fn default_ef_construction() -> usize {
-    200
-}
-
-fn default_max_nb_connection() -> usize {
-    16
+fn default_vector_bit_width() -> usize {
+    4
 }
 
 impl VectorOptions {
@@ -50,8 +41,7 @@ impl VectorOptions {
             dimension,
             distance: VectorDistance::default(),
             stored: false,
-            ef_construction: default_ef_construction(),
-            max_nb_connection: default_max_nb_connection(),
+            bit_width: default_vector_bit_width(),
         }
     }
 
@@ -67,15 +57,9 @@ impl VectorOptions {
         self
     }
 
-    /// Sets HNSW `ef_construction`.
-    pub fn set_ef_construction(mut self, ef: usize) -> Self {
-        self.ef_construction = ef;
-        self
-    }
-
-    /// Sets the maximum number of HNSW connections per node.
-    pub fn set_max_nb_connection(mut self, m: usize) -> Self {
-        self.max_nb_connection = m;
+    /// Sets TurboQuant bits per coordinate for cosine/dot fields.
+    pub fn set_bit_width(mut self, bit_width: usize) -> Self {
+        self.bit_width = bit_width;
         self
     }
 

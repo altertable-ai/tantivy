@@ -1,26 +1,30 @@
 use crate::collector::TopDocs;
 use crate::error::TantivyError;
 use crate::query::KnnQuery;
-use crate::schema::{Schema, VectorOptions};
+use crate::schema::{Schema, VectorOptions, INDEXED};
 use crate::vector::io::l2_normalize;
-use crate::{Index, IndexWriter};
+use crate::{Index, IndexWriter, Term};
+
+fn vec8(x: f32, y: f32, z: f32) -> Vec<f32> {
+    vec![x, y, z, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
 
 #[test]
 fn knn_query_orders_by_similarity() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
-    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(3));
+    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(8));
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer(15_000_000)?;
-    writer.add_document(doc!(emb => vec![1.0f32, 0.0, 0.0]))?;
-    writer.add_document(doc!(emb => vec![0.0f32, 1.0, 0.0]))?;
-    writer.add_document(doc!(emb => vec![0.0f32, 0.0, 1.0]))?;
+    writer.add_document(doc!(emb => vec8(1.0, 0.0, 0.0)))?;
+    writer.add_document(doc!(emb => vec8(0.0, 1.0, 0.0)))?;
+    writer.add_document(doc!(emb => vec8(0.0, 0.0, 1.0)))?;
     writer.commit()?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let seg = searcher.segment_reader(0);
     let vread = seg.vector_readers().get(emb).expect("vector reader");
-    let query_vec = vec![0.0f32, 1.0, 0.0];
+    let query_vec = vec8(0.0, 1.0, 0.0);
     let mut qn = query_vec.clone();
     l2_normalize(&mut qn);
     let mut best_doc = 0u32;
@@ -47,21 +51,21 @@ fn knn_query_orders_by_similarity() -> crate::Result<()> {
 #[test]
 fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
-    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(3));
+    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(8));
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema);
     {
         let mut writer: IndexWriter = index.writer(15_000_000)?;
-        writer.add_document(doc!(emb => vec![1.0f32, 0.0, 0.0]))?;
-        writer.add_document(doc!(emb => vec![0.9f32, 0.1, 0.0]))?;
-        writer.add_document(doc!(emb => vec![0.8f32, 0.2, 0.0]))?;
+        writer.add_document(doc!(emb => vec8(1.0, 0.0, 0.0)))?;
+        writer.add_document(doc!(emb => vec8(0.9, 0.1, 0.0)))?;
+        writer.add_document(doc!(emb => vec8(0.8, 0.2, 0.0)))?;
         writer.commit()?;
     }
     {
         let mut writer: IndexWriter = index.writer(15_000_000)?;
-        writer.add_document(doc!(emb => vec![0.0f32, 1.0, 0.0]))?;
-        writer.add_document(doc!(emb => vec![0.0f32, 0.9, 0.1]))?;
-        writer.add_document(doc!(emb => vec![0.0f32, 0.8, 0.2]))?;
+        writer.add_document(doc!(emb => vec8(0.0, 1.0, 0.0)))?;
+        writer.add_document(doc!(emb => vec8(0.0, 0.9, 0.1)))?;
+        writer.add_document(doc!(emb => vec8(0.0, 0.8, 0.2)))?;
         writer.commit()?;
     }
     {
@@ -79,7 +83,7 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
         .vector_readers()
         .get(emb)
         .expect("merged segment should load vector index");
-    let query = [0.0f32, 1.0, 0.0];
+    let query = vec8(0.0, 1.0, 0.0);
     let mut q = query.to_vec();
     l2_normalize(&mut q);
     let mut best_doc = 0u32;
@@ -109,13 +113,44 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
 }
 
 #[test]
+fn knn_query_filters_deleted_docs() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let id = schema_builder.add_u64_field("id", INDEXED);
+    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(8));
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema);
+    {
+        let mut writer: IndexWriter = index.writer(15_000_000)?;
+        writer.add_document(doc!(id => 0u64, emb => vec8(0.0, 1.0, 0.0)))?;
+        writer.add_document(doc!(id => 1u64, emb => vec8(0.0, 0.95, 0.05)))?;
+        writer.add_document(doc!(id => 2u64, emb => vec8(1.0, 0.0, 0.0)))?;
+        writer.commit()?;
+    }
+    {
+        let mut writer: IndexWriter = index.writer(15_000_000)?;
+        writer.delete_term(Term::from_field_u64(id, 0));
+        writer.commit()?;
+    }
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let query = KnnQuery::new(emb, vec8(0.0, 1.0, 0.0), 2).with_ef_search(64);
+    let top_docs = searcher.search(&query, &TopDocs::with_limit(2).order_by_score())?;
+    assert_eq!(top_docs.len(), 2);
+    assert!(
+        top_docs.iter().all(|(_, addr)| addr.doc_id != 0),
+        "deleted best-match doc must not be returned"
+    );
+    Ok(())
+}
+
+#[test]
 fn knn_query_rejects_wrong_query_dimension() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
-    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(3));
+    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(8));
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer(15_000_000)?;
-    writer.add_document(doc!(emb => vec![1.0f32, 0.0, 0.0]))?;
+    writer.add_document(doc!(emb => vec8(1.0, 0.0, 0.0)))?;
     writer.commit()?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
