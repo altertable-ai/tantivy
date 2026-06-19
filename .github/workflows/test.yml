@@ -2,12 +2,15 @@ name: Unit tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 # Ensures that we cancel running jobs for the same PR / same workflow.
 concurrency:
@@ -16,46 +19,50 @@ concurrency:
 
 jobs:
   check:
-
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      checks: write
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-    - name: Install nightly
-      uses: actions-rs/toolchain@v1
-      with:
-            toolchain: nightly
-            profile: minimal
-            components: rustfmt
-    - name: Install nightly
-      uses: actions-rs/toolchain@v1
-      with:
-            toolchain: nightly
-            profile: minimal
-            components: clippy
+      - name: Install nightly
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          toolchain: nightly
+          profile: minimal
+          components: rustfmt
+      - name: Install nightly
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          toolchain: nightly
+          profile: minimal
+          components: clippy
 
-    - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-    - name: Check Formatting
-      run: cargo +nightly fmt --all -- --check
+      - name: Check Formatting
+        run: cargo +nightly fmt --all -- --check
 
-    - name: Check Compilation
-      run: cargo +nightly build --all-features
+      - name: Check Compilation
+        run: cargo +nightly build --all-features
 
+      - name: Check Bench Compilation
+        run: cargo +nightly bench --no-run --profile=dev --all-features
 
-    - name: Check Bench Compilation
-      run: cargo +nightly bench --no-run --profile=dev --all-features
-
-    - uses: actions-rs/clippy-check@v1
-      with:
-        toolchain: nightly
-        token: ${{ secrets.GITHUB_TOKEN }}
-        args: --tests
+      - uses: actions-rs/clippy-check@b5b5f21f4797c02da247df37026fcd0a5024aa4d # v1.0.7
+        with:
+          toolchain: nightly
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --tests
 
   test:
-
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
 
     strategy:
       matrix:
@@ -63,48 +70,51 @@ jobs:
           - stable
           - nightly
         features:
-          - { label: "all", flags: "mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer,vector" }
+          - {
+              label: "all",
+              flags: "mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer,vector",
+            }
           - { label: "quickwit", flags: "mmap,quickwit,failpoints" }
           - { label: "none", flags: "" }
 
     name: test-${{ matrix.toolchain }}-${{ matrix.features.label}}
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-    - name: Install toolchain
-      uses: actions-rs/toolchain@v1
-      with:
-            toolchain: ${{ matrix.toolchain }}
-            profile: minimal
-            override: true
+      - name: Install toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          profile: minimal
+          override: true
 
-    - uses: taiki-e/install-action@nextest
-    - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@56cc9adf3a3e2c23eafb56e8acaf9d0373cb845a # nextest
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-    - name: Resolve feature flags
-      id: features
-      run: |
-        FLAGS="${{ matrix.features.flags }}"
-        if [[ "${{ matrix.toolchain }}" == "nightly" && "$FLAGS" == *"vector"* ]]; then
-          FLAGS="${FLAGS},vector-simd"
-        fi
-        echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+      - name: Resolve feature flags
+        id: features
+        run: |
+          FLAGS="${{ matrix.features.flags }}"
+          if [[ "${{ matrix.toolchain }}" == "nightly" && "$FLAGS" == *"vector"* ]]; then
+            FLAGS="${FLAGS},vector-simd"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
 
-    - name: Run tests
-      run: |
-        FLAGS="${{ steps.features.outputs.flags }}"
-        if [ -z "$FLAGS" ]; then
-          cargo nextest run --lib --no-default-features --verbose --workspace
-        else
-          cargo nextest run --features "$FLAGS" --no-default-features --verbose --workspace
-        fi
+      - name: Run tests
+        run: |
+          FLAGS="${{ steps.features.outputs.flags }}"
+          if [ -z "$FLAGS" ]; then
+            cargo nextest run --lib --no-default-features --verbose --workspace
+          else
+            cargo nextest run --features "$FLAGS" --no-default-features --verbose --workspace
+          fi
 
-    - name: Run doctests
-      run: |
-        FLAGS="${{ steps.features.outputs.flags }}"
-        if [ -z "$FLAGS" ]; then
-          echo "no doctest for no feature flag"
-        else
-          cargo test --doc --features "$FLAGS" --verbose --workspace
-        fi
+      - name: Run doctests
+        run: |
+          FLAGS="${{ steps.features.outputs.flags }}"
+          if [ -z "$FLAGS" ]; then
+            echo "no doctest for no feature flag"
+          else
+            cargo test --doc --features "$FLAGS" --verbose --workspace
+          fi
