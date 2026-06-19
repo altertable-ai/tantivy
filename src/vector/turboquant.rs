@@ -253,6 +253,76 @@ pub(crate) fn dequantize_flat(
     Ok(out)
 }
 
+/// Lossily reconstruct one document row without scanning the full corpus.
+pub(crate) fn dequantize_row(
+    packed_codes: &[u8],
+    row: usize,
+    rotation: &[f32],
+    centroids: &[f32],
+    shift: &[f32],
+    scale_tq: &[f32],
+    norms: &[f32],
+    bit_width: usize,
+    dim: usize,
+    num_docs: usize,
+    distance: VectorDistance,
+) -> crate::Result<Vec<f32>> {
+    let rl = row_len(dim, bit_width);
+    let start = row * rl;
+    let end = start + rl;
+    if row >= num_docs || end > packed_codes.len() {
+        return Err(TantivyError::DataCorruption(
+            crate::error::DataCorruption::comment_only("TurboQuant row out of range"),
+        ));
+    }
+    let shift_identity;
+    let scale_identity;
+    let shift = if shift.is_empty() {
+        shift_identity = vec![0.0f32; dim];
+        shift_identity.as_slice()
+    } else {
+        shift
+    };
+    let scale = if scale_tq.is_empty() {
+        scale_identity = vec![1.0f32; dim];
+        scale_identity.as_slice()
+    } else {
+        scale_tq
+    };
+    if shift.len() != dim || scale.len() != dim {
+        return Err(TantivyError::DataCorruption(
+            crate::error::DataCorruption::comment_only("TurboQuant TQ+ length mismatch"),
+        ));
+    }
+    if distance == VectorDistance::DotProduct && norms.len() != num_docs {
+        return Err(TantivyError::DataCorruption(
+            crate::error::DataCorruption::comment_only("TurboQuant norms length mismatch"),
+        ));
+    }
+
+    let mut rotated = vec![0f32; dim];
+    let mut unit = vec![0f32; dim];
+    decode_rotated_row(
+        &packed_codes[start..end],
+        centroids,
+        shift,
+        scale,
+        bit_width,
+        dim,
+        &mut rotated,
+    );
+    inverse_rotate(&rotated, rotation, &mut unit);
+    let norm = if distance == VectorDistance::DotProduct {
+        norms[row]
+    } else {
+        1.0
+    };
+    for d in 0..dim {
+        unit[d] *= norm;
+    }
+    Ok(unit)
+}
+
 pub(crate) fn packed_len(num_docs: usize, dim: usize, bit_width: usize) -> usize {
     num_docs * row_len(dim, bit_width)
 }

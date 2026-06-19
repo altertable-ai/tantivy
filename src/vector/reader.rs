@@ -132,11 +132,23 @@ impl VectorFieldReader {
     /// Lossily reconstructed vector for `doc`, if in range.
     pub fn vector(&self, doc: DocId) -> crate::Result<Option<Vec<f32>>> {
         let dim = self.options.dimension;
-        if doc >= self.num_docs {
+        let num_docs = self.num_docs as usize;
+        if doc as usize >= num_docs {
             return Ok(None);
         }
-        let flat = self.flat_vectors()?;
-        let start = doc as usize * dim;
-        Ok(Some(flat[start..start + dim].to_vec()))
+        let norms = self.lazy.parse_turbo_norms()?;
+        Ok(Some(turboquant::dequantize_row(
+            self.lazy.turbo_packed_codes(),
+            doc as usize,
+            &self.cache.rotation,
+            &self.cache.centroids,
+            &self.tqplus_shift,
+            &self.tqplus_scale,
+            &norms,
+            self.bit_width,
+            dim,
+            num_docs,
+            self.options.distance,
+        )?))
     }
 }
