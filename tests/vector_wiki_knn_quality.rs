@@ -4,9 +4,10 @@
 //! These compare [`KnnQuery`] results to brute-force cosine-distance ranking so future
 //! storage/compression changes (e.g. quantization) can be checked against a baseline.
 //!
-//! **Brute-force ground truth** for recall uses **lossily reconstructed** rows from
-//! [`VectorFieldReader::flat_vectors`] (BBQ round-trip), so rankings are compared in the same
-//! approximate space as HNSW search (asymmetric BBQ distances target this reconstruction).
+//! **Brute-force ground truth** uses the **original full-precision `f32` embeddings** from
+//! [`load_fixture_vectors`] (the wiki fixture bytes), **not** the HNSW graph and **not** any
+//! lossy representation. After indexing + merge, dequantized rows from the index are checked
+//! against a per-dimension tolerance derived from SQ8 scales (not bit-exact).
 //!
 //! **Note:** With `harness = false`, `benches/vector_wiki.rs` is not built as a test target, so
 //! quality checks live here instead of inside the Criterion bench file.
@@ -109,7 +110,7 @@ fn build_wiki_index() -> tantivy::Result<(Index, tantivy::schema::Field)> {
     Ok((index, field))
 }
 
-/// Lossily reconstructed `f32` flat from the vector index (BBQ).
+/// Dequantized `f32` flat from the vector index (SQ8 round-trip).
 fn corpus_rows_from_reader(
     field: tantivy::schema::Field,
     index: &Index,
@@ -139,6 +140,11 @@ fn corpus_rows_from_reader(
         .collect())
 }
 
+/// Worst-case per-dimension error for scalar quantization with bin width `scale` (uniform bins).
+fn max_sq8_dim_error(scale: f32) -> f32 {
+    scale * 0.5 + 1e-5
+}
+
 /// One test builds the index once to avoid running two heavy indexes in parallel (default
 /// `cargo test` runs `#[test]` fns concurrently), which was flaky under `--all-features`.
 #[test]
@@ -153,32 +159,47 @@ fn wiki_knn_quality_against_brute_force_fixture() -> tantivy::Result<()> {
         .vector_readers()
         .get(field)
         .expect("vector field reader");
+    let (_mins, scales) = vread.quantization_params();
 
+    // Row order matches insertion order (DocId); values are within SQ8 error of the fixture.
     assert_eq!(rows.len(), original_fixture.len());
-    for (doc_idx, row) in rows.iter().enumerate() {
-        let v = vread.vector(doc_idx as u32)?.expect("vector");
-        assert_eq!(
-            row.as_slice(),
-            v.as_slice(),
-            "flat_vectors row {doc_idx} must match vector()"
-        );
+    for (doc_idx, (row, orig_row)) in rows.iter().zip(original_fixture.iter()).enumerate() {
+        for d in 0..EMBEDDING_DIM {
+            let err = (row[d] - orig_row[d]).abs();
+            assert!(
+                err <= max_sq8_dim_error(scales[d]),
+                "doc {doc_idx} dim {d}: dequant error {err} exceeds bound (scale={})",
+                scales[d]
+            );
+        }
+    }
+
+    for qi in [0usize, 42, 256, 500, 999] {
+        let v = vread.vector(qi as u32)?.expect("vector");
+        for d in 0..EMBEDDING_DIM {
+            let err = (v[d] - original_fixture[qi][d]).abs();
+            assert!(
+                err <= max_sq8_dim_error(scales[d]),
+                "vector({qi}) dim {d}: dequant error {err}"
+            );
+        }
     }
 
     let k = 10usize;
-    let ef = 2048usize;
+    let ef = 1024usize;
     let query_indices = [42usize, 128, 333, 500, 750];
 
     for &qi in &query_indices {
         let query = &original_fixture[qi];
-        let truth = brute_force_top_k_ids(query, &rows, k);
+        let truth = brute_force_top_k_ids(query, &original_fixture, k);
         let q = KnnQuery::new(field, query.clone(), k).with_ef_search(ef);
         let top_docs = searcher.search(&q, &TopDocs::with_limit(k).order_by_score())?;
         assert_eq!(top_docs.len(), k, "query index {qi}");
         let retrieved: Vec<u32> = top_docs.iter().map(|(_, addr)| addr.doc_id).collect();
         let recall = recall_at_k(&truth, &retrieved);
         assert!(
-            recall >= 0.8,
-            "query index {qi}: recall@{k} was {recall} (expected >= 0.8). truth={truth:?} \
+            recall >= 0.85,
+            "query index {qi}: recall@{k} was {recall} (expected >= 0.85). truth={truth:?} \
              retrieved={retrieved:?}",
         );
     }
