@@ -1,5 +1,5 @@
 //! Collects per-document vectors during segment indexing and serializes the compact
-//! HNSW graph + BBQ-packed vectors into the `.vec` file (V4 `TNVYVEC4` format).
+//! HNSW graph + SQ8-quantized flat vectors into the `.vec` file (V3 `TNVYVEC3` format).
 
 use std::io::Write;
 
@@ -8,7 +8,6 @@ use common::TerminatingWrite;
 use crate::directory::WritePtr;
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row, compute_bbq_params};
 use crate::vector::hnsw::extract_compact_graph;
 use crate::vector::io::{normalize_flat_for_cosine, write_vec_file, VectorFieldBundle};
 use crate::{DocId, TantivyError};
@@ -121,30 +120,12 @@ impl VectorFieldsWriter {
                 field_writer.options.distance,
             );
 
-            let dim = field_writer.options.dimension;
-            let (centroid, bbq_bits, bbq_lower, bbq_upper) =
-                compute_bbq_params(&flat, dim, max_doc as usize);
-            // HNSW topology must match BBQ recon; reuse `flat` to avoid a second full allocation.
-            let bpr = bbq_bytes_per_row(dim);
-            for row in 0..max_doc as usize {
-                let bits = &bbq_bits[row * bpr..(row + 1) * bpr];
-                bbq_dequantize_row(
-                    &centroid,
-                    bits,
-                    bbq_lower[row],
-                    bbq_upper[row],
-                    &mut flat[row * dim..(row + 1) * dim],
-                );
-            }
             let graph = extract_compact_graph(&field_writer.options, max_doc, &flat)?;
             bundles.push(VectorFieldBundle {
                 field_id: field_writer.field.field_id(),
                 options: field_writer.options.clone(),
                 num_docs: max_doc,
-                centroid,
-                bbq_bits,
-                bbq_lower,
-                bbq_upper,
+                flat,
                 graph,
             });
         }

@@ -1,7 +1,8 @@
 //! On-disk layout for the `.vec` segment file.
 //!
-//! **V4 format** (magic `TNVYVEC4`): field centroid + BBQ (1-bit residuals + per-vector
-//! lower/upper) + mmap-friendly packed bits + uncompressed compact HNSW graph.
+//! **V3 format** (magic `TNVYVEC3`): per-dimension scalar quantization (SQ8) + mmap-friendly
+//! flat `u8` vectors + uncompressed compact HNSW graph. No zstd. Older formats are not
+//! supported.
 
 use std::io::Write;
 use std::ops::Range;
@@ -10,11 +11,10 @@ use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::schema::{VectorDistance, VectorOptions};
-use crate::vector::bbq::{bbq_bytes_per_row, bbq_dequantize_row};
 use crate::TantivyError;
 
-pub(crate) const MAGIC: &[u8; 8] = b"TNVYVEC4";
-const VERSION: u32 = 4;
+pub(crate) const MAGIC: &[u8; 8] = b"TNVYVEC3";
+const VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Compact HNSW graph
@@ -156,6 +156,118 @@ impl CompactHnswGraph {
 }
 
 // ---------------------------------------------------------------------------
+// SQ8 quantization (shared by writer, reader, merger)
+// ---------------------------------------------------------------------------
+
+/// Per-dimension min/max over all rows in `flat` (row-major, `num_docs * dim` floats).
+pub(crate) fn compute_sq8_params(
+    num_docs: usize,
+    dim: usize,
+    flat: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(flat.len(), num_docs * dim);
+    let mut mins = vec![f32::INFINITY; dim];
+    let mut maxs = vec![f32::NEG_INFINITY; dim];
+    for row in 0..num_docs {
+        let base = row * dim;
+        for d in 0..dim {
+            let v = flat[base + d];
+            mins[d] = mins[d].min(v);
+            maxs[d] = maxs[d].max(v);
+        }
+    }
+    let scales: Vec<f32> = mins
+        .iter()
+        .zip(maxs.iter())
+        .map(|(&min, &max)| {
+            if max > min {
+                (max - min) / 255.0f32
+            } else {
+                0.0f32
+            }
+        })
+        .collect();
+    (mins, scales)
+}
+
+/// Quantize row-major `f32` flat to `u8` using `mins` / `scales` from [`compute_sq8_params`].
+pub(crate) fn quantize_flat_to_u8(
+    flat: &[f32],
+    dim: usize,
+    mins: &[f32],
+    scales: &[f32],
+) -> Vec<u8> {
+    assert_eq!(mins.len(), dim);
+    assert_eq!(scales.len(), dim);
+    let n = flat.len() / dim;
+    let mut out = vec![0u8; flat.len()];
+    for row in 0..n {
+        let base = row * dim;
+        for d in 0..dim {
+            let v = flat[base + d];
+            let min = mins[d];
+            let scale = scales[d];
+            out[base + d] = if scale > 0.0f32 {
+                ((v - min) / scale).round().clamp(0.0f32, 255.0f32) as u8
+            } else {
+                0
+            };
+        }
+    }
+    out
+}
+
+/// Dequantize one row (`dim` bytes) into `out` (length `dim`).
+///
+/// With `vector-simd`: 8-wide portable SIMD.
+/// Without: scalar `f32` loop (auto-vectorizes to 4-wide NEON on AArch64).
+#[inline]
+pub(crate) fn dequantize_row_into(row: &[u8], mins: &[f32], scales: &[f32], out: &mut [f32]) {
+    let dim = row.len();
+    debug_assert_eq!(mins.len(), dim);
+    debug_assert_eq!(scales.len(), dim);
+    debug_assert_eq!(out.len(), dim);
+
+    #[cfg(feature = "vector-simd")]
+    return simd_impl::dequantize_row_into(row, mins, scales, out);
+
+    #[cfg(not(feature = "vector-simd"))]
+    for d in 0..dim {
+        let q = row[d] as f32;
+        out[d] = mins[d] + q * scales[d];
+    }
+}
+
+/// Dequantize full flat `u8` to `f32` row-major.
+pub(crate) fn dequantize_flat_u8_to_f32(
+    flat_u8: &[u8],
+    num_docs: usize,
+    dim: usize,
+    mins: &[f32],
+    scales: &[f32],
+) -> crate::Result<Vec<f32>> {
+    if flat_u8.len() != num_docs * dim {
+        return Err(corruption(format!(
+            "quantized flat size mismatch: {} bytes for {} docs x {}",
+            flat_u8.len(),
+            num_docs,
+            dim
+        )));
+    }
+    let mut out = vec![0f32; num_docs * dim];
+    for row in 0..num_docs {
+        let base = row * dim;
+        dequantize_row_into(
+            &flat_u8[base..base + dim],
+            mins,
+            scales,
+            &mut out[base..base + dim],
+        );
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // L2 normalization (cosine → dot-product conversion)
 // ---------------------------------------------------------------------------
 
@@ -202,10 +314,7 @@ pub(crate) struct VectorFieldBundle {
     pub field_id: u32,
     pub options: VectorOptions,
     pub num_docs: u32,
-    pub centroid: Vec<f32>,
-    pub bbq_bits: Vec<u8>,
-    pub bbq_lower: Vec<f32>,
-    pub bbq_upper: Vec<f32>,
+    pub flat: Vec<f32>,
     pub graph: CompactHnswGraph,
 }
 
@@ -230,39 +339,16 @@ pub(crate) fn write_vec_file(
         writer.write_u32::<LittleEndian>(bundle.num_docs)?;
         writer.write_u32::<LittleEndian>(dim as u32)?;
 
-        if bundle.centroid.len() != dim {
-            return Err(TantivyError::InternalError(format!(
-                "BBQ centroid len {} != dim {}",
-                bundle.centroid.len(),
-                dim
-            )));
+        let (mins, scales) = compute_sq8_params(num_docs, dim, &bundle.flat);
+        for &m in &mins {
+            writer.write_f32::<LittleEndian>(m)?;
         }
-        for &c in &bundle.centroid {
-            writer.write_f32::<LittleEndian>(c)?;
+        for &s in &scales {
+            writer.write_f32::<LittleEndian>(s)?;
         }
 
-        let bpr = bbq_bytes_per_row(dim);
-        let bits_len = num_docs * bpr;
-        if bundle.bbq_bits.len() != bits_len
-            || bundle.bbq_lower.len() != num_docs
-            || bundle.bbq_upper.len() != num_docs
-        {
-            return Err(TantivyError::InternalError(format!(
-                "BBQ payload mismatch: bits {} lowers {} uppers {} for {} docs x {} bpr",
-                bundle.bbq_bits.len(),
-                bundle.bbq_lower.len(),
-                bundle.bbq_upper.len(),
-                num_docs,
-                bpr
-            )));
-        }
-        writer.write_all(&bundle.bbq_bits)?;
-        for &lo in &bundle.bbq_lower {
-            writer.write_f32::<LittleEndian>(lo)?;
-        }
-        for &hi in &bundle.bbq_upper {
-            writer.write_f32::<LittleEndian>(hi)?;
-        }
+        let quantized = quantize_flat_to_u8(&bundle.flat, dim, &mins, &scales);
+        writer.write_all(&quantized)?;
 
         let graph_raw = bundle.graph.serialize();
         writer.write_u64::<LittleEndian>(graph_raw.len() as u64)?;
@@ -281,77 +367,46 @@ pub(crate) struct LazyVectorField {
     pub num_docs: u32,
     pub dimension: usize,
     raw: OwnedBytes,
-    centroid_range: Range<usize>,
-    bbq_bits_range: Range<usize>,
-    bbq_lower_range: Range<usize>,
-    bbq_upper_range: Range<usize>,
+    mins_range: Range<usize>,
+    scales_range: Range<usize>,
+    vectors_range: Range<usize>,
     graph_range: Range<usize>,
 }
 
 impl LazyVectorField {
-    pub(crate) fn centroid_bytes(&self) -> &[u8] {
-        &self.raw[self.centroid_range.clone()]
+    pub(crate) fn mins_bytes(&self) -> &[u8] {
+        &self.raw[self.mins_range.clone()]
     }
 
-    pub(crate) fn bbq_bits_bytes(&self) -> &[u8] {
-        &self.raw[self.bbq_bits_range.clone()]
+    pub(crate) fn scales_bytes(&self) -> &[u8] {
+        &self.raw[self.scales_range.clone()]
     }
 
-    pub(crate) fn bbq_lower_bytes(&self) -> &[u8] {
-        &self.raw[self.bbq_lower_range.clone()]
+    pub(crate) fn quantized_vectors(&self) -> &[u8] {
+        &self.raw[self.vectors_range.clone()]
     }
 
-    pub(crate) fn bbq_upper_bytes(&self) -> &[u8] {
-        &self.raw[self.bbq_upper_range.clone()]
-    }
-
-    pub(crate) fn parse_centroid(&self) -> crate::Result<Vec<f32>> {
-        f32_slice_from_bytes(self.centroid_bytes(), self.dimension)
-    }
-
-    pub(crate) fn parse_lowers(&self) -> crate::Result<Vec<f32>> {
-        f32_slice_from_bytes(self.bbq_lower_bytes(), self.num_docs as usize)
-    }
-
-    pub(crate) fn parse_uppers(&self) -> crate::Result<Vec<f32>> {
-        f32_slice_from_bytes(self.bbq_upper_bytes(), self.num_docs as usize)
+    pub(crate) fn parse_mins_scales(&self) -> crate::Result<(Vec<f32>, Vec<f32>)> {
+        let dim = self.dimension;
+        let mins = f32_slice_from_bytes(self.mins_bytes(), dim)?;
+        let scales = f32_slice_from_bytes(self.scales_bytes(), dim)?;
+        Ok((mins, scales))
     }
 
     pub(crate) fn parse_graph(&self) -> crate::Result<CompactHnswGraph> {
         CompactHnswGraph::deserialize(&self.raw[self.graph_range.clone()])
     }
 
-    /// Full dequantized flat (merge / `flat_vectors` API), lossy BBQ reconstruction.
+    /// Full dequantized flat (merge / `flat_vectors` API).
     pub(crate) fn dequantize_flat(&self) -> crate::Result<Vec<f32>> {
-        let dim = self.dimension;
-        let num_docs = self.num_docs as usize;
-        let centroid = self.parse_centroid()?;
-        let lowers = self.parse_lowers()?;
-        let uppers = self.parse_uppers()?;
-        let bits = self.bbq_bits_bytes();
-        let bpr = bbq_bytes_per_row(dim);
-        if bits.len() != num_docs * bpr {
-            return Err(corruption(format!(
-                "BBQ bits len {} != {} docs * {} bpr",
-                bits.len(),
-                num_docs,
-                bpr
-            )));
-        }
-        let mut out = vec![0f32; num_docs * dim];
-        let mut row_bits = vec![0u8; bpr];
-        for row in 0..num_docs {
-            row_bits.copy_from_slice(&bits[row * bpr..(row + 1) * bpr]);
-            let base = row * dim;
-            bbq_dequantize_row(
-                &centroid,
-                &row_bits,
-                lowers[row],
-                uppers[row],
-                &mut out[base..base + dim],
-            );
-        }
-        Ok(out)
+        let (mins, scales) = self.parse_mins_scales()?;
+        dequantize_flat_u8_to_f32(
+            self.quantized_vectors(),
+            self.num_docs as usize,
+            self.dimension,
+            &mins,
+            &scales,
+        )
     }
 }
 
@@ -363,7 +418,7 @@ pub(crate) fn read_vec_file_lazy(data: FileSlice) -> crate::Result<Vec<LazyVecto
     check_len(buf, 0, 8, "magic")?;
     if &buf[..8] != MAGIC {
         return Err(corruption(format!(
-            "unsupported .vec format (expected TNVYVEC4, got {:?})",
+            "unsupported .vec format (expected TNVYVEC3, got {:?})",
             std::str::from_utf8(&buf[..8]).unwrap_or("???")
         )));
     }
@@ -385,26 +440,20 @@ pub(crate) fn read_vec_file_lazy(data: FileSlice) -> crate::Result<Vec<LazyVecto
         let num_docs = read_u32_le(buf, &mut pos)? as usize;
         let dimension = read_u32_le(buf, &mut pos)? as usize;
 
-        let centroid_len = dimension * 4;
-        check_len(buf, pos, centroid_len, "centroid")?;
-        let centroid_range = pos..pos + centroid_len;
-        pos += centroid_len;
+        let mins_len = dimension * 4;
+        check_len(buf, pos, mins_len, "mins")?;
+        let mins_range = pos..pos + mins_len;
+        pos += mins_len;
 
-        let bpr = bbq_bytes_per_row(dimension);
-        let bits_len = num_docs * bpr;
-        check_len(buf, pos, bits_len, "bbq_bits")?;
-        let bbq_bits_range = pos..pos + bits_len;
-        pos += bits_len;
+        let scales_len = dimension * 4;
+        check_len(buf, pos, scales_len, "scales")?;
+        let scales_range = pos..pos + scales_len;
+        pos += scales_len;
 
-        let lowers_len = num_docs * 4;
-        check_len(buf, pos, lowers_len, "bbq_lower")?;
-        let bbq_lower_range = pos..pos + lowers_len;
-        pos += lowers_len;
-
-        let uppers_len = num_docs * 4;
-        check_len(buf, pos, uppers_len, "bbq_upper")?;
-        let bbq_upper_range = pos..pos + uppers_len;
-        pos += uppers_len;
+        let vec_len = num_docs * dimension;
+        check_len(buf, pos, vec_len, "vectors")?;
+        let vectors_range = pos..pos + vec_len;
+        pos += vec_len;
 
         let graph_len = read_u64_le(buf, &mut pos)? as usize;
         check_len(buf, pos, graph_len, "graph")?;
@@ -417,10 +466,9 @@ pub(crate) fn read_vec_file_lazy(data: FileSlice) -> crate::Result<Vec<LazyVecto
             num_docs: num_docs as u32,
             dimension,
             raw: bytes.clone(),
-            centroid_range,
-            bbq_bits_range,
-            bbq_lower_range,
-            bbq_upper_range,
+            mins_range,
+            scales_range,
+            vectors_range,
             graph_range,
         });
     }
@@ -429,7 +477,7 @@ pub(crate) fn read_vec_file_lazy(data: FileSlice) -> crate::Result<Vec<LazyVecto
 
 fn f32_slice_from_bytes(bytes: &[u8], dim: usize) -> crate::Result<Vec<f32>> {
     if bytes.len() != dim * 4 {
-        return Err(corruption("f32 slice length mismatch"));
+        return Err(corruption("mins/scales length mismatch"));
     }
     let mut v = Vec::with_capacity(dim);
     for chunk in bytes.chunks_exact(4) {
@@ -443,6 +491,7 @@ fn f32_slice_from_bytes(bytes: &[u8], dim: usize) -> crate::Result<Vec<f32>> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "vector-simd")]
+#[allow(dead_code)]
 mod simd_impl {
     use std::simd::prelude::*;
 
@@ -512,35 +561,105 @@ mod simd_impl {
             }
         }
     }
+
+    #[inline]
+    pub(super) fn dequantize_row_into(row: &[u8], mins: &[f32], scales: &[f32], out: &mut [f32]) {
+        let dim = row.len();
+        let full = dim / LANES;
+        for c in 0..full {
+            let i = c * LANES;
+            let q = F32x::from_array(std::array::from_fn(|j| row[i + j] as f32));
+            let m = F32x::from_slice(&mins[i..]);
+            let s = F32x::from_slice(&scales[i..]);
+            (m + q * s).copy_to_slice(&mut out[i..i + LANES]);
+        }
+        for i in (full * LANES)..dim {
+            out[i] = mins[i] + (row[i] as f32) * scales[i];
+        }
+    }
+
+    /// Fused dequantize + L2 distance — keeps dequantized values in SIMD registers,
+    /// never writes to a scratch buffer.
+    #[inline]
+    pub(super) fn dequant_dist_l2(query: &[f32], row: &[u8], mins: &[f32], scales: &[f32]) -> f32 {
+        let dim = query.len();
+        let full = dim / LANES;
+        let mut acc = F32x::splat(0.0);
+        for c in 0..full {
+            let i = c * LANES;
+            let q = F32x::from_array(std::array::from_fn(|j| row[i + j] as f32));
+            let deq = F32x::from_slice(&mins[i..]) + q * F32x::from_slice(&scales[i..]);
+            let d = F32x::from_slice(&query[i..]) - deq;
+            acc += d * d;
+        }
+        let mut sum = acc.reduce_sum();
+        for i in (full * LANES)..dim {
+            let deq = mins[i] + (row[i] as f32) * scales[i];
+            let d = query[i] - deq;
+            sum += d * d;
+        }
+        sum.sqrt()
+    }
+
+    /// Fused dequantize + dot-product distance.
+    #[inline]
+    pub(super) fn dequant_dist_dot(query: &[f32], row: &[u8], mins: &[f32], scales: &[f32]) -> f32 {
+        let dim = query.len();
+        let full = dim / LANES;
+        let mut acc = F32x::splat(0.0);
+        for c in 0..full {
+            let i = c * LANES;
+            let q = F32x::from_array(std::array::from_fn(|j| row[i + j] as f32));
+            let deq = F32x::from_slice(&mins[i..]) + q * F32x::from_slice(&scales[i..]);
+            acc += F32x::from_slice(&query[i..]) * deq;
+        }
+        let mut dot = acc.reduce_sum();
+        for i in (full * LANES)..dim {
+            let deq = mins[i] + (row[i] as f32) * scales[i];
+            dot += query[i] * deq;
+        }
+        (1.0f32 - dot).max(0.0f32)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Score from distance
+// Distance helpers (used by the search module)
 // ---------------------------------------------------------------------------
 
 pub(crate) fn distance_to_score(distance: f32) -> crate::Score {
     1.0f32 / (1.0f32 + distance)
 }
 
-/// Exact distance between two `f32` vectors (used after BBQ reconstruction at query time).
-#[inline]
+#[allow(dead_code)]
 pub(crate) fn distance_fn_for(dist: VectorDistance) -> fn(&[f32], &[f32]) -> f32 {
     match dist {
         #[cfg(feature = "vector-simd")]
         VectorDistance::Euclidean => simd_impl::dist_l2,
         #[cfg(not(feature = "vector-simd"))]
-        VectorDistance::Euclidean => dist_l2_f32,
+        VectorDistance::Euclidean => dist_l2,
 
         #[cfg(feature = "vector-simd")]
         VectorDistance::Cosine | VectorDistance::DotProduct => simd_impl::dist_dot,
         #[cfg(not(feature = "vector-simd"))]
-        VectorDistance::Cosine | VectorDistance::DotProduct => dist_dot_f32,
+        VectorDistance::Cosine | VectorDistance::DotProduct => dist_dot,
+    }
+}
+
+/// Fused dequantize-from-SQ8 + distance in one pass (SIMD-accelerated).
+/// Avoids the scratch-buffer round-trip on the search hot path.
+#[cfg(feature = "vector-simd")]
+pub(crate) fn dequant_distance_fn_for(
+    dist: VectorDistance,
+) -> fn(&[f32], &[u8], &[f32], &[f32]) -> f32 {
+    match dist {
+        VectorDistance::Euclidean => simd_impl::dequant_dist_l2,
+        VectorDistance::Cosine | VectorDistance::DotProduct => simd_impl::dequant_dist_dot,
     }
 }
 
 #[cfg(not(feature = "vector-simd"))]
 #[inline]
-fn dist_l2_f32(a: &[f32], b: &[f32]) -> f32 {
+fn dist_l2(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = 0.0f32;
     for i in 0..a.len() {
@@ -552,7 +671,7 @@ fn dist_l2_f32(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(not(feature = "vector-simd"))]
 #[inline]
-fn dist_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+fn dist_dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut dot = 0.0f32;
     for i in 0..a.len() {
