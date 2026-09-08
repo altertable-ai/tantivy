@@ -1,18 +1,18 @@
-//! HNSW search directly on the compact graph + scalar-quantized flat vectors.
+//! HNSW search on the compact mmap'd graph + 4-bit TurboQuant codes.
 //!
-//! Candidate vectors are dequantized row-by-row into a scratch buffer for distance
-//! evaluation (no full flat decompression / allocation on the search path beyond
-//! one `dim`-sized scratch buffer).
+//! The query is rotated once; each candidate is scored from packed nibbles
+//! (cosine/dot) or reconstructed (euclidean). Neighbor lists are iterated
+//! straight out of the mmap blob.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::schema::VectorDistance;
-#[cfg(feature = "vector-simd")]
-use crate::vector::io::dequant_distance_fn_for;
 use crate::vector::io::CompactHnswGraph;
-#[cfg(not(feature = "vector-simd"))]
-use crate::vector::io::{dequantize_row_into, distance_fn_for};
+use crate::vector::turboquant::{
+    dist_dot_packed, dist_dot_packed_batch, dist_l2_packed, packed_bytes, prepare_query, Codebook,
+    PreparedQuery, TqPlus, FASTSCAN_N,
+};
 
 /// Wrapper returned by [`search`] — same fields as the old `hnsw_rs::prelude::Neighbour`
 /// so the reader can convert to `(DocId, Score)` unchanged.
@@ -21,13 +21,13 @@ pub(crate) struct SearchResult {
     pub distance: f32,
 }
 
-/// Run an approximate k-NN search on the compact HNSW graph over SQ8-stored vectors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn search(
     graph: &CompactHnswGraph,
-    flat_u8: &[u8],
-    mins: &[f32],
-    scales: &[f32],
+    packed: &[u8],
+    renorm: &[f32],
+    tqplus: &TqPlus,
+    codebook: &Codebook,
     dim: usize,
     dist: VectorDistance,
     query: &[f32],
@@ -38,40 +38,49 @@ pub(crate) fn search(
         return Vec::new();
     }
 
-    // With vector-simd: fused dequantize+distance keeps values in SIMD registers,
-    // no scratch buffer needed. Without: two-step dequantize → distance via scratch.
-    #[cfg(feature = "vector-simd")]
-    let dequant_distance = dequant_distance_fn_for(dist);
-    #[cfg(not(feature = "vector-simd"))]
-    let distance = distance_fn_for(dist);
-    #[cfg(not(feature = "vector-simd"))]
-    let mut scratch = vec![0f32; dim];
+    let padded = tqplus.shift.len();
+    let stride = packed_bytes(padded);
+    let prepared = prepare_query(query, dim, tqplus, codebook);
 
-    macro_rules! row_distance {
-        ($id:expr) => {{
-            let start = $id as usize * dim;
-            let row = &flat_u8[start..start + dim];
-            #[cfg(feature = "vector-simd")]
-            {
-                dequant_distance(query, row, mins, scales)
-            }
-            #[cfg(not(feature = "vector-simd"))]
-            {
-                dequantize_row_into(row, mins, scales, &mut scratch);
-                distance(query, &scratch)
-            }
-        }};
+    match dist {
+        VectorDistance::Euclidean => search_graph(graph, k, ef, |id| {
+            let start = id as usize * stride;
+            let row = &packed[start..start + stride];
+            let r = renorm.get(id as usize).copied().unwrap_or(1.0);
+            dist_l2_packed(&prepared, row, dim, padded, codebook, tqplus, r)
+        }),
+        VectorDistance::Cosine | VectorDistance::DotProduct => {
+            search_graph_dot(graph, k, ef, packed, stride, renorm, &prepared)
+        }
     }
+}
+
+fn search_graph_dot(
+    graph: &CompactHnswGraph,
+    k: usize,
+    ef: usize,
+    packed: &[u8],
+    stride: usize,
+    renorm: &[f32],
+    prepared: &PreparedQuery,
+) -> Vec<SearchResult> {
+    let score_one = |id: u32| {
+        let start = id as usize * stride;
+        debug_assert!(start + stride <= packed.len());
+        debug_assert!((id as usize) < renorm.len());
+        let row = unsafe { packed.get_unchecked(start..start + stride) };
+        let r = unsafe { *renorm.get_unchecked(id as usize) };
+        dist_dot_packed(prepared, row, r)
+    };
 
     let mut current = graph.entry_point;
-    let mut current_dist = row_distance!(current);
+    let mut current_dist = score_one(current);
 
-    // Greedy descent: layers entry_layer → 1  (skip layer 0 — that gets the beam search).
     for layer in (1..=graph.entry_layer as usize).rev() {
         loop {
             let mut improved = false;
-            for &neighbor in graph.neighbors(current, layer) {
-                let d = row_distance!(neighbor);
+            for neighbor in graph.neighbors(current, layer) {
+                let d = score_one(neighbor);
                 if d < current_dist {
                     current = neighbor;
                     current_dist = d;
@@ -84,7 +93,106 @@ pub(crate) fn search(
         }
     }
 
-    // ef-bounded beam search at layer 0.
+    let ef_actual = ef.max(k);
+    let mut candidates: BinaryHeap<Reverse<DistId>> = BinaryHeap::new();
+    let mut results: BinaryHeap<DistId> = BinaryHeap::new();
+    let mut visited = VisitedSet::new(graph.num_points);
+
+    visited.mark(current);
+    candidates.push(Reverse(DistId(current_dist, current)));
+    results.push(DistId(current_dist, current));
+
+    let mut buf = [0u32; FASTSCAN_N];
+    let mut dists = [0.0f32; FASTSCAN_N];
+    let mut buf_n = 0usize;
+
+    let mut flush = |ids: &[u32],
+                     results: &mut BinaryHeap<DistId>,
+                     candidates: &mut BinaryHeap<Reverse<DistId>>| {
+        if ids.is_empty() {
+            return;
+        }
+        dist_dot_packed_batch(
+            prepared,
+            packed,
+            stride,
+            ids,
+            renorm,
+            &mut dists[..ids.len()],
+        );
+        for (i, &id) in ids.iter().enumerate() {
+            let d = dists[i];
+            let worst = results.peek().map_or(f32::INFINITY, |r| r.0);
+            if d < worst || results.len() < ef_actual {
+                candidates.push(Reverse(DistId(d, id)));
+                results.push(DistId(d, id));
+                if results.len() > ef_actual {
+                    results.pop();
+                }
+            }
+        }
+    };
+
+    while let Some(Reverse(DistId(c_dist, c_id))) = candidates.pop() {
+        let worst = results.peek().map_or(f32::INFINITY, |d| d.0);
+        if c_dist > worst && results.len() >= ef_actual {
+            break;
+        }
+
+        for neighbor in graph.neighbors(c_id, 0) {
+            if !visited.mark(neighbor) {
+                continue;
+            }
+            buf[buf_n] = neighbor;
+            buf_n += 1;
+            if buf_n == FASTSCAN_N {
+                flush(&buf, &mut results, &mut candidates);
+                buf_n = 0;
+            }
+        }
+    }
+    if buf_n > 0 {
+        flush(&buf[..buf_n], &mut results, &mut candidates);
+    }
+
+    let mut out: Vec<SearchResult> = results
+        .into_iter()
+        .map(|DistId(d, id)| SearchResult {
+            doc_id: id,
+            distance: d,
+        })
+        .collect();
+    out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    out.truncate(k);
+    out
+}
+
+fn search_graph(
+    graph: &CompactHnswGraph,
+    k: usize,
+    ef: usize,
+    row_distance: impl Fn(u32) -> f32,
+) -> Vec<SearchResult> {
+    let mut current = graph.entry_point;
+    let mut current_dist = row_distance(current);
+
+    for layer in (1..=graph.entry_layer as usize).rev() {
+        loop {
+            let mut improved = false;
+            for neighbor in graph.neighbors(current, layer) {
+                let d = row_distance(neighbor);
+                if d < current_dist {
+                    current = neighbor;
+                    current_dist = d;
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+
     let ef_actual = ef.max(k);
     let mut candidates: BinaryHeap<Reverse<DistId>> = BinaryHeap::new();
     let mut results: BinaryHeap<DistId> = BinaryHeap::new();
@@ -100,11 +208,11 @@ pub(crate) fn search(
             break;
         }
 
-        for &neighbor in graph.neighbors(c_id, 0) {
+        for neighbor in graph.neighbors(c_id, 0) {
             if !visited.mark(neighbor) {
                 continue;
             }
-            let d = row_distance!(neighbor);
+            let d = row_distance(neighbor);
             let worst = results.peek().map_or(f32::INFINITY, |r| r.0);
             if d < worst || results.len() < ef_actual {
                 candidates.push(Reverse(DistId(d, neighbor)));
@@ -128,11 +236,6 @@ pub(crate) fn search(
     out
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Ordered (distance, id) pair for BinaryHeap. Uses `total_cmp` so NaN is handled.
 #[derive(Clone, Copy, PartialEq)]
 struct DistId(f32, u32);
 
@@ -150,7 +253,6 @@ impl Ord for DistId {
     }
 }
 
-/// Bit-vector for O(1) visited checks instead of a `HashSet`.
 struct VisitedSet {
     bits: Vec<u64>,
 }
@@ -163,7 +265,6 @@ impl VisitedSet {
         }
     }
 
-    /// Mark `id` as visited; returns `true` if it was **not** previously visited.
     #[inline]
     fn mark(&mut self, id: u32) -> bool {
         let word = id as usize / 64;

@@ -540,7 +540,7 @@ impl IndexMerger {
             };
             let dim = options.dimension;
 
-            // Load dequantized flat vectors for each segment (SQ8 → f32) for merge + HNSW rebuild.
+            // Reconstruct TQ4 → f32 for merge + HNSW rebuild.
             let segment_flats: Vec<Option<Vec<f32>>> = self
                 .readers
                 .iter()

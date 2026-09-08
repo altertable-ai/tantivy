@@ -1,5 +1,5 @@
 //! Collects per-document vectors during segment indexing and serializes the compact
-//! HNSW graph + SQ8-quantized flat vectors into the `.vec` file (V3 `TNVYVEC3` format).
+//! HNSW graph + 4-bit TurboQuant codes into the `.vec` file (V4 `TNVYVEC4` format).
 
 use std::io::Write;
 
