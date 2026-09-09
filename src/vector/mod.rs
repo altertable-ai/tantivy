@@ -11,6 +11,8 @@ mod mmaped_hnsw;
 #[cfg(feature = "vector")]
 pub(crate) mod reader;
 #[cfg(feature = "vector")]
+mod turboquant;
+#[cfg(feature = "vector")]
 pub(crate) mod writer;
 
 #[cfg(feature = "vector")]

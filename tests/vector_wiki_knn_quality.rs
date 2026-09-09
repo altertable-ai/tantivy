@@ -6,8 +6,8 @@
 //!
 //! **Brute-force ground truth** uses the **original full-precision `f32` embeddings** from
 //! [`load_fixture_vectors`] (the wiki fixture bytes), **not** the HNSW graph and **not** any
-//! lossy representation. After indexing + merge, dequantized rows from the index are checked
-//! against a per-dimension tolerance derived from SQ8 scales (not bit-exact).
+//! lossy representation. After indexing + merge, reconstructed rows from the index are checked
+//! for cosine agreement with the fixture (4-bit TurboQuant, not bit-exact).
 //!
 //! **Note:** With `harness = false`, `benches/vector_wiki.rs` is not built as a test target, so
 //! quality checks live here instead of inside the Criterion bench file.
@@ -110,7 +110,7 @@ fn build_wiki_index() -> tantivy::Result<(Index, tantivy::schema::Field)> {
     Ok((index, field))
 }
 
-/// Dequantized `f32` flat from the vector index (SQ8 round-trip).
+/// Dequantized `f32` flat from the vector index (TQ4 reconstruction).
 fn corpus_rows_from_reader(
     field: tantivy::schema::Field,
     index: &Index,
@@ -140,9 +140,20 @@ fn corpus_rows_from_reader(
         .collect())
 }
 
-/// Worst-case per-dimension error for scalar quantization with bin width `scale` (uniform bins).
-fn max_sq8_dim_error(scale: f32) -> f32 {
-    scale * 0.5 + 1e-5
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na > 0.0 && nb > 0.0 {
+        dot / (na.sqrt() * nb.sqrt())
+    } else {
+        0.0
+    }
 }
 
 /// One test builds the index once to avoid running two heavy indexes in parallel (default
@@ -159,30 +170,23 @@ fn wiki_knn_quality_against_brute_force_fixture() -> tantivy::Result<()> {
         .vector_readers()
         .get(field)
         .expect("vector field reader");
-    let (_mins, scales) = vread.quantization_params();
 
-    // Row order matches insertion order (DocId); values are within SQ8 error of the fixture.
     assert_eq!(rows.len(), original_fixture.len());
     for (doc_idx, (row, orig_row)) in rows.iter().zip(original_fixture.iter()).enumerate() {
-        for d in 0..EMBEDDING_DIM {
-            let err = (row[d] - orig_row[d]).abs();
-            assert!(
-                err <= max_sq8_dim_error(scales[d]),
-                "doc {doc_idx} dim {d}: dequant error {err} exceeds bound (scale={})",
-                scales[d]
-            );
-        }
+        let cos = cosine_sim(row, orig_row);
+        assert!(
+            cos > 0.99,
+            "doc {doc_idx}: TQ4 reconstruction cosine {cos} too low"
+        );
     }
 
     for qi in [0usize, 42, 256, 500, 999] {
         let v = vread.vector(qi as u32)?.expect("vector");
-        for d in 0..EMBEDDING_DIM {
-            let err = (v[d] - original_fixture[qi][d]).abs();
-            assert!(
-                err <= max_sq8_dim_error(scales[d]),
-                "vector({qi}) dim {d}: dequant error {err}"
-            );
-        }
+        let cos = cosine_sim(&v, &original_fixture[qi]);
+        assert!(
+            cos > 0.99,
+            "vector({qi}): TQ4 reconstruction cosine {cos} too low"
+        );
     }
 
     let k = 10usize;
@@ -198,8 +202,8 @@ fn wiki_knn_quality_against_brute_force_fixture() -> tantivy::Result<()> {
         let retrieved: Vec<u32> = top_docs.iter().map(|(_, addr)| addr.doc_id).collect();
         let recall = recall_at_k(&truth, &retrieved);
         assert!(
-            recall >= 0.85,
-            "query index {qi}: recall@{k} was {recall} (expected >= 0.85). truth={truth:?} \
+            recall >= 1.0,
+            "query index {qi}: recall@{k} was {recall} (expected 1.0). truth={truth:?} \
              retrieved={retrieved:?}",
         );
     }
