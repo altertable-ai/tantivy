@@ -42,6 +42,25 @@ pub(crate) fn search(
     let stride = packed_bytes(padded);
     let prepared = prepare_query(query, dim, tqplus, codebook);
 
+    if graph.num_points as usize <= k {
+        return match dist {
+            VectorDistance::Euclidean => exhaustive_search(graph, k, |id| {
+                let start = id as usize * stride;
+                let row = &packed[start..start + stride];
+                let r = renorm.get(id as usize).copied().unwrap_or(1.0);
+                dist_l2_packed(&prepared, row, dim, padded, codebook, tqplus, r)
+            }),
+            VectorDistance::Cosine | VectorDistance::DotProduct => {
+                exhaustive_search(graph, k, |id| {
+                    let start = id as usize * stride;
+                    let row = &packed[start..start + stride];
+                    let r = renorm.get(id as usize).copied().unwrap_or(1.0);
+                    dist_dot_packed(&prepared, row, r)
+                })
+            }
+        };
+    }
+
     match dist {
         VectorDistance::Euclidean => search_graph(graph, k, ef, |id| {
             let start = id as usize * stride;
@@ -53,6 +72,22 @@ pub(crate) fn search(
             search_graph_dot(graph, k, ef, packed, stride, renorm, &prepared)
         }
     }
+}
+
+fn exhaustive_search(
+    graph: &CompactHnswGraph,
+    k: usize,
+    row_distance: impl Fn(u32) -> f32,
+) -> Vec<SearchResult> {
+    let mut out: Vec<SearchResult> = (0..graph.num_points)
+        .map(|id| SearchResult {
+            doc_id: id,
+            distance: row_distance(id),
+        })
+        .collect();
+    out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    out.truncate(k);
+    out
 }
 
 fn search_graph_dot(
@@ -274,5 +309,60 @@ impl VisitedSet {
         }
         self.bits[word] |= bit;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::turboquant::{codebook_for_dim, encode_flat};
+
+    /// Three isolated points: layer-0 walk from the entry point can only score id 0.
+    fn isolated_three() -> CompactHnswGraph {
+        CompactHnswGraph::new(0, 0, 3, vec![vec![Vec::new()]; 3])
+    }
+
+    fn search_isolated(dist: VectorDistance, k: usize) -> Vec<u32> {
+        let dim = 4usize;
+        let flat = [
+            1.0, 0.0, 0.0, 0.0, // 0
+            0.0, 1.0, 0.0, 0.0, // 1 — query
+            0.0, 0.0, 1.0, 0.0, // 2
+        ];
+        let enc = encode_flat(3, dim, &flat);
+        let codebook = codebook_for_dim(enc.padded_dim);
+        search(
+            &isolated_three(),
+            &enc.packed,
+            &enc.renorm,
+            &enc.tqplus,
+            &codebook,
+            dim,
+            dist,
+            &[0.0, 1.0, 0.0, 0.0],
+            k,
+            1,
+        )
+        .into_iter()
+        .map(|r| r.doc_id)
+        .collect()
+    }
+
+    #[test]
+    fn k_at_least_n_returns_isolated_nodes() {
+        for dist in [
+            VectorDistance::Cosine,
+            VectorDistance::DotProduct,
+            VectorDistance::Euclidean,
+        ] {
+            for k in [3, 10] {
+                let ids = search_isolated(dist, k);
+                assert_eq!(ids.len(), 3, "{dist:?} k={k}");
+                assert_eq!(ids[0], 1, "{dist:?} k={k}: nearest must be the query row");
+                let mut all = ids;
+                all.sort_unstable();
+                assert_eq!(all, [0, 1, 2], "{dist:?} k={k}");
+            }
+        }
     }
 }

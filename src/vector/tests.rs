@@ -85,6 +85,33 @@ fn merge_segments_rebuilds_vector_index() -> crate::Result<()> {
     Ok(())
 }
 
+/// HNSW can miss unreachable points; when `k >= n` we brute-force so every doc is returned.
+#[test]
+fn knn_query_returns_all_docs_when_k_covers_the_segment() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let emb = schema_builder.add_vector_field("emb", VectorOptions::new(3));
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema);
+    let mut writer = index.writer_for_tests()?;
+    writer.add_document(doc!(emb => vec![1.0f32, 0.0, 0.0]))?;
+    writer.add_document(doc!(emb => vec![0.0f32, 1.0, 0.0]))?;
+    writer.add_document(doc!(emb => vec![0.0f32, 0.0, 1.0]))?;
+    writer.commit()?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    assert_eq!(searcher.segment_readers().len(), 1);
+    assert_eq!(searcher.segment_reader(0).num_docs(), 3);
+
+    let query = KnnQuery::new(emb, vec![0.0f32, 1.0, 0.0], 10).with_ef_search(1);
+    let top_docs = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
+    assert_eq!(top_docs.len(), 3);
+    assert_eq!(top_docs[0].1.doc_id, 1);
+    let mut ids: Vec<u32> = top_docs.iter().map(|(_, addr)| addr.doc_id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1, 2]);
+    Ok(())
+}
+
 #[test]
 fn knn_query_rejects_wrong_query_dimension() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
