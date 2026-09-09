@@ -169,6 +169,24 @@ impl<'a> Value<'a> for &'a Vec<u8> {
     }
 }
 
+impl<'a> Value<'a> for &'a [f32] {
+    type ArrayIter = Empty<&'a [f32]>;
+    type ObjectIter = Empty<(&'a str, &'a [f32])>;
+    #[inline]
+    fn as_value(&self) -> ReferenceValue<'a, Self> {
+        ReferenceValue::Leaf(ReferenceValueLeaf::Vector(self))
+    }
+}
+
+impl<'a> Value<'a> for &'a Vec<f32> {
+    type ArrayIter = Empty<&'a Vec<f32>>;
+    type ObjectIter = Empty<(&'a str, &'a Vec<f32>)>;
+    #[inline]
+    fn as_value(&self) -> ReferenceValue<'a, Self> {
+        ReferenceValue::Leaf(ReferenceValueLeaf::Vector(self.as_slice()))
+    }
+}
+
 impl<'a> Value<'a> for &'a DateTime {
     type ArrayIter = Empty<&'a DateTime>;
     type ObjectIter = Empty<(&'a str, &'a DateTime)>;

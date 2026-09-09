@@ -12,7 +12,14 @@ readme = "README.md"
 keywords = ["search", "information", "retrieval"]
 edition = "2021"
 rust-version = "1.86"
-exclude = ["benches/*.json", "benches/*.txt"]
+exclude = [
+    "benches/*.json",
+    "benches/*.txt",
+    "benches/hf_models",
+    "benches/scripts/.venv",
+    "benches/wiki_embedded.f32.bin",
+    "benches/wiki_embedded.meta.json",
+]
 
 [dependencies]
 oneshot = "0.1.13"
@@ -70,6 +77,8 @@ futures-util = { version = "0.3.28", optional = true }
 futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
 typetag = "0.2.21"
+hnsw_rs = { version = "0.3.4", optional = true }
+anndists = { version = "0.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -113,13 +122,22 @@ debug-assertions = true
 overflow-checks = true
 
 [features]
-default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer"]
+default = [
+    "mmap",
+    "stopwords",
+    "lz4-compression",
+    "columnar-zstd-compression",
+    "stemmer",
+    "vector",
+]
+vector = ["dep:hnsw_rs", "dep:anndists"]
+vector-simd = ["vector", "hnsw_rs/stdsimd", "anndists/stdsimd"]
 stemmer = ["rust-stemmers"]
-mmap = ["fs4", "tempfile", "memmap2"]
+mmap = ["fs4", "dep:tempfile", "memmap2"]
 stopwords = []
 
 lz4-compression = ["lz4_flex"]
-zstd-compression = ["zstd"]
+zstd-compression = ["dep:zstd"]
 
 # enable zstd-compression in columnar (and sstable)
 columnar-zstd-compression = ["columnar/zstd-compression"]
@@ -200,6 +218,10 @@ harness = false
 
 [[bench]]
 name = "regex_all_terms"
+harness = false
+
+[[bench]]
+name = "vector_wiki"
 harness = false
 
 [[bench]]

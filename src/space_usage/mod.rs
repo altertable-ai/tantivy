@@ -73,6 +73,10 @@ pub struct SegmentSpaceUsage {
 
     store: StoreSpaceUsage,
 
+    /// Approximate nearest neighbor vector index (`.vec` file).
+    #[serde(default)]
+    vector_index: ByteCount,
+
     deletes: ByteCount,
 
     total: ByteCount,
@@ -88,6 +92,7 @@ impl SegmentSpaceUsage {
         fast_fields: PerFieldSpaceUsage,
         fieldnorms: PerFieldSpaceUsage,
         store: StoreSpaceUsage,
+        vector_index: ByteCount,
         deletes: ByteCount,
     ) -> SegmentSpaceUsage {
         let total = termdict.total()
@@ -96,6 +101,7 @@ impl SegmentSpaceUsage {
             + fast_fields.total()
             + fieldnorms.total()
             + store.total()
+            + vector_index
             + deletes;
         SegmentSpaceUsage {
             num_docs,
@@ -105,6 +111,7 @@ impl SegmentSpaceUsage {
             fast_fields,
             fieldnorms,
             store,
+            vector_index,
             deletes,
             total,
         }
@@ -124,6 +131,7 @@ impl SegmentSpaceUsage {
             FieldNorms => PerField(self.fieldnorms().clone()),
             Terms => PerField(self.termdict().clone()),
             SegmentComponent::Store => ComponentSpaceUsage::Store(self.store().clone()),
+            VectorIndex => Basic(self.vector_index()),
             Delete => Basic(self.deletes()),
         }
     }
@@ -161,6 +169,11 @@ impl SegmentSpaceUsage {
     /// Space usage for stored documents
     pub fn store(&self) -> &StoreSpaceUsage {
         &self.store
+    }
+
+    /// Space usage for the vector index (`.vec` file).
+    pub fn vector_index(&self) -> ByteCount {
+        self.vector_index
     }
 
     /// Space usage for document deletions

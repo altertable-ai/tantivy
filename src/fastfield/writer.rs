@@ -189,6 +189,9 @@ impl FastFieldsWriter {
                             .record_str(doc_id, field_name, &token.text);
                     }
                 }
+                ReferenceValueLeaf::Vector(_) => {
+                    // Vectors are not stored in the columnar fast-field format.
+                }
             },
             ReferenceValue::Array(val) => {
                 // TODO: Check this is the correct behaviour we want.
@@ -319,6 +322,9 @@ fn record_json_value_to_columnar_writer<'a, V: Value<'a>>(
                 unimplemented!(
                     "Pre-tokenized string support in dynamic fields is not yet implemented"
                 )
+            }
+            ReferenceValueLeaf::Vector(_) => {
+                unimplemented!("Vector support in dynamic JSON fields is not yet implemented")
             }
         },
         ReferenceValue::Array(elements) => {

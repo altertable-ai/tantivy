@@ -1,9 +1,10 @@
+use std::io::Write;
 use std::sync::Arc;
 
 use columnar::{
     ColumnType, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder,
 };
-use common::ReadOnlyBitSet;
+use common::{ReadOnlyBitSet, TerminatingWrite};
 use itertools::Itertools;
 use measure_time::debug_time;
 
@@ -19,6 +20,9 @@ use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
+use crate::vector::write_vec_file;
+#[cfg(feature = "vector")]
+use crate::vector::{build_compact_graph_from_flat, normalize_flat_for_cosine, VectorFieldBundle};
 use crate::{DocAddress, DocId, InvertedIndexReader};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
@@ -520,6 +524,93 @@ impl IndexMerger {
         Ok(())
     }
 
+    #[cfg(feature = "vector")]
+    fn write_vector_fields(
+        &self,
+        serializer: &mut SegmentSerializer,
+        doc_id_mapping: &SegmentDocIdMapping,
+    ) -> crate::Result<()> {
+        let Some(mut vec_write) = serializer.extract_vector_write() else {
+            return Ok(());
+        };
+        let mut bundles: Vec<VectorFieldBundle> = Vec::new();
+        for (field, field_entry) in self.schema.fields() {
+            let FieldType::Vector(options) = field_entry.field_type() else {
+                continue;
+            };
+            let dim = options.dimension;
+
+            // Reconstruct TQ4 → f32 for merge + HNSW rebuild.
+            let segment_flats: Vec<Option<Vec<f32>>> = self
+                .readers
+                .iter()
+                .map(|reader| {
+                    reader
+                        .vector_readers()
+                        .get(field)
+                        .map(|vfr| vfr.flat_vectors())
+                        .transpose()
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+
+            let mut flat: Vec<f32> = Vec::with_capacity(self.max_doc as usize * dim);
+            for old_addr in doc_id_mapping.iter_old_doc_addrs() {
+                let seg_flat = segment_flats[old_addr.segment_ord as usize]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::TantivyError::DataCorruption(
+                            crate::error::DataCorruption::comment_only(format!(
+                                "Missing vector reader for field {:?} during merge",
+                                field_entry.name()
+                            )),
+                        )
+                    })?;
+                let start = old_addr.doc_id as usize * dim;
+                let end = start + dim;
+                if end > seg_flat.len() {
+                    return Err(crate::TantivyError::DataCorruption(
+                        crate::error::DataCorruption::comment_only(format!(
+                            "Missing vector for field {:?} during merge (doc {:?})",
+                            field_entry.name(),
+                            old_addr
+                        )),
+                    ));
+                }
+                flat.extend_from_slice(&seg_flat[start..end]);
+            }
+            normalize_flat_for_cosine(&mut flat, dim, options.distance);
+            let graph = build_compact_graph_from_flat(options, self.max_doc, &flat)?;
+            bundles.push(VectorFieldBundle {
+                field_id: field.field_id(),
+                options: options.clone(),
+                num_docs: self.max_doc,
+                flat,
+                graph,
+            });
+        }
+        write_vec_file(&mut vec_write, &bundles)?;
+        vec_write.flush()?;
+        vec_write.terminate()?;
+        Ok(())
+    }
+
+    /// Without the `vector` feature, vector merge is a no-op; the writer is still finalized so
+    /// `SegmentSerializer::close` does not see a dangling vector handle.
+    #[cfg(not(feature = "vector"))]
+    fn write_vector_fields(
+        &self,
+        serializer: &mut SegmentSerializer,
+        _doc_id_mapping: &SegmentDocIdMapping,
+    ) -> crate::Result<()> {
+        let Some(mut vec_write) = serializer.extract_vector_write() else {
+            return Ok(());
+        };
+        write_vec_file(&mut vec_write, &[])?;
+        vec_write.flush()?;
+        vec_write.terminate()?;
+        Ok(())
+    }
+
     /// Writes the merged segment by pushing information
     /// to the `SegmentSerializer`.
     ///
@@ -544,6 +635,8 @@ impl IndexMerger {
 
         debug!("write-storagefields");
         self.write_storable_fields(serializer.get_store_writer())?;
+        debug!("write-vector-index");
+        self.write_vector_fields(&mut serializer, &doc_id_mapping)?;
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 

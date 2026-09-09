@@ -17,6 +17,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
+use crate::vector::VectorFieldReaders;
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -48,6 +49,10 @@ pub struct SegmentReader {
     store_file: FileSlice,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
+
+    vector_readers: VectorFieldReaders,
+    /// Retained for [`SegmentReader::space_usage`] (byte length of `.vec`).
+    vector_index_file: Option<FileSlice>,
 }
 
 impl SegmentReader {
@@ -91,6 +96,11 @@ impl SegmentReader {
     /// May panic if the index is corrupted.
     pub fn fast_fields(&self) -> &FastFieldReaders {
         &self.fast_fields_readers
+    }
+
+    /// Readers for dense vector fields (HNSW index) in this segment.
+    pub fn vector_readers(&self) -> &VectorFieldReaders {
+        &self.vector_readers
     }
 
     /// Accessor to the `FacetReader` associated with a given `Field`.
@@ -173,6 +183,13 @@ impl SegmentReader {
         let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
 
+        let vector_index_file = segment.open_read(SegmentComponent::VectorIndex).ok();
+        let vector_readers = if let Some(ref slice) = vector_index_file {
+            VectorFieldReaders::open(slice.clone())?
+        } else {
+            VectorFieldReaders::empty()
+        };
+
         let original_bitset = if segment.meta().has_deletes() {
             let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
             let alive_doc_data = alive_doc_file_slice.read_bytes()?;
@@ -203,6 +220,8 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite,
             schema,
+            vector_readers,
+            vector_index_file,
         })
     }
 
@@ -452,6 +471,11 @@ impl SegmentReader {
 
     /// Summarize total space usage of this segment.
     pub fn space_usage(&self) -> io::Result<SegmentSpaceUsage> {
+        let vector_index = self
+            .vector_index_file
+            .as_ref()
+            .map(|s| ByteCount::from(s.len()))
+            .unwrap_or_default();
         Ok(SegmentSpaceUsage::new(
             self.num_docs(),
             self.termdict_composite.space_usage(self.schema()),
@@ -460,6 +484,7 @@ impl SegmentReader {
             self.fast_fields_readers.space_usage()?,
             self.fieldnorm_readers.space_usage(self.schema()),
             self.get_store_reader(0)?.space_usage(),
+            vector_index,
             self.alive_bitset_opt
                 .as_ref()
                 .map(AliveBitSet::space_usage)

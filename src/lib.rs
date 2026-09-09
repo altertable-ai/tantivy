@@ -1,5 +1,6 @@
 #![doc(html_logo_url = "http://fulmicoton.com/tantivy-logo/tantivy-logo.png")]
 #![cfg_attr(all(feature = "unstable", test), feature(test))]
+#![cfg_attr(feature = "vector-simd", feature(portable_simd))]
 #![doc(test(attr(allow(unused_variables), deny(warnings))))]
 #![warn(missing_docs)]
 #![allow(
@@ -204,6 +205,7 @@ pub mod schema;
 pub mod space_usage;
 pub mod store;
 pub mod termdict;
+pub mod vector;
 
 mod docset;
 mod reader;

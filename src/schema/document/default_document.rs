@@ -254,6 +254,13 @@ impl CompactDoc {
             }
             ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
             ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
+            ReferenceValueLeaf::Vector(slice) => {
+                let mut bytes: Vec<u8> = Vec::with_capacity(slice.len() * 4);
+                for &f in slice {
+                    bytes.extend_from_slice(&f.to_le_bytes());
+                }
+                write_bytes_into(&mut self.node_data, &bytes)
+            }
         };
         ValueAddr { type_id, val_addr }
     }
@@ -472,6 +479,18 @@ impl<'a> CompactDocValue<'a> {
                 self.container,
                 addr,
             )?)),
+            ValueType::Vector => {
+                let data = self.container.extract_bytes(addr);
+                let mut out = Vec::with_capacity(data.len() / 4);
+                for chunk in data.chunks_exact(4) {
+                    out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                }
+                // `CompactDoc` stores vectors as byte blobs; we materialize an `f32` slice.
+                // Until `CompactDoc` carries an owning pool, we leak a boxed slice (same doc
+                // typically does not re-read the same vector field repeatedly).
+                let s: &'static [f32] = Box::leak(out.into_boxed_slice());
+                Ok(ReferenceValueLeaf::Vector(s).into())
+            }
         }
     }
 }
@@ -542,6 +561,8 @@ pub enum ValueType {
     Object = 11,
     /// Pre-tokenized str type,
     Array = 12,
+    /// Dense `f32` vector (embedding).
+    Vector = 13,
 }
 
 impl BinarySerializable for ValueType {
@@ -552,7 +573,7 @@ impl BinarySerializable for ValueType {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let num = u8::deserialize(reader)?;
-        let type_id = if (0..=12).contains(&num) {
+        let type_id = if (0..=13).contains(&num) {
             unsafe { std::mem::transmute::<u8, ValueType>(num) }
         } else {
             return Err(io::Error::new(
@@ -587,6 +608,7 @@ impl<'a> From<&ReferenceValueLeaf<'a>> for ValueType {
             ReferenceValueLeaf::PreTokStr(_) => ValueType::PreTokStr,
             ReferenceValueLeaf::Facet(_) => ValueType::Facet,
             ReferenceValueLeaf::Bytes(_) => ValueType::Bytes,
+            ReferenceValueLeaf::Vector(_) => ValueType::Vector,
         }
     }
 }

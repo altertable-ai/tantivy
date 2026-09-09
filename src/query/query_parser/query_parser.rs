@@ -437,6 +437,11 @@ impl QueryParser {
         let field_supports_ff_range_queries = field_type.is_fast()
             && is_type_valid_for_fastfield_range_query(field_type.value_type());
 
+        if matches!(field_type, FieldType::Vector(_)) {
+            return Err(QueryParserError::UnsupportedQuery(
+                "Vector fields are searched with KnnQuery, not the query parser".to_string(),
+            ));
+        }
         if !field_type.is_indexed() && !field_supports_ff_range_queries {
             return Err(QueryParserError::FieldNotIndexed(
                 field_entry.name().to_string(),
@@ -524,6 +529,9 @@ impl QueryParser {
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
                 Ok(Term::from_field_ip_addr(field, ip_v6))
             }
+            FieldType::Vector(_) => Err(QueryParserError::UnsupportedQuery(
+                "Vector fields are searched with KnnQuery, not the query parser".to_string(),
+            )),
         }
     }
 
@@ -538,6 +546,11 @@ impl QueryParser {
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let field_name = field_entry.name();
+        if matches!(field_type, FieldType::Vector(_)) {
+            return Err(QueryParserError::UnsupportedQuery(
+                "Vector fields are searched with KnnQuery, not the query parser".to_string(),
+            ));
+        }
         if !field_type.is_indexed() {
             return Err(QueryParserError::FieldNotIndexed(field_name.to_string()));
         }
@@ -624,6 +637,9 @@ impl QueryParser {
                 let term = Term::from_field_ip_addr(field, ip_v6);
                 Ok(vec![LogicalLiteral::Term(term)])
             }
+            FieldType::Vector(_) => Err(QueryParserError::UnsupportedQuery(
+                "Vector fields are searched with KnnQuery, not the query parser".to_string(),
+            )),
         }
     }
 
@@ -2119,6 +2135,23 @@ mod test {
         assert_eq!(
             err.to_string(),
             "Unsupported query: Regex queries are not allowed."
+        );
+    }
+
+    #[test]
+    fn vector_field_rejected_by_query_parser() {
+        use crate::schema::VectorOptions;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_vector_field("vec", VectorOptions::new(4));
+        let schema = schema_builder.build();
+        let tokenizer_manager = TokenizerManager::default();
+        let qp = QueryParser::new(schema, vec![], tokenizer_manager);
+        let err = qp.parse_query("vec:hello").unwrap_err();
+        assert_matches!(err, QueryParserError::UnsupportedQuery(_));
+        assert_eq!(
+            err.to_string(),
+            "Unsupported query: Vector fields are searched with KnnQuery, not the query parser"
         );
     }
 }
