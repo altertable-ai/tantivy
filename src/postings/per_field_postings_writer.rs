@@ -71,7 +71,7 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
         }
         // These fields are never indexed, so this writer is never fed terms. It only needs to
         // occupy the per-field slot (the vector is indexed by field id).
-        FieldType::TieBreaker | FieldType::Custom(_) => {
+        FieldType::TieBreaker | FieldType::Custom(_) | FieldType::Vector(_) => {
             Box::<SpecializedPostingsWriter<DocIdRecorder>>::default()
         }
     }

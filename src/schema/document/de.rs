@@ -163,6 +163,8 @@ pub enum ValueType {
     Array,
     /// A dynamic object value.
     Object,
+    /// A dense `f32` vector.
+    Vector,
     /// A JSON object value. Deprecated.
     #[deprecated(note = "We keep this for backwards compatibility, use Object instead")]
     JSONObject,
@@ -244,6 +246,12 @@ pub trait ValueVisitor {
         _val: PreTokenizedString,
     ) -> Result<Self::Value, DeserializeError> {
         Err(DeserializeError::UnsupportedType(ValueType::PreTokStr))
+    }
+
+    #[inline]
+    /// Called when the deserializer visits a dense vector.
+    fn visit_vector(&self, _val: Vec<f32>) -> Result<Self::Value, DeserializeError> {
+        Err(DeserializeError::UnsupportedType(ValueType::Vector))
     }
 
     #[inline]
@@ -394,6 +402,7 @@ where R: Read
             type_codes::NULL_CODE => ValueType::Null,
             type_codes::ARRAY_CODE => ValueType::Array,
             type_codes::OBJECT_CODE => ValueType::Object,
+            type_codes::VECTOR_CODE => ValueType::Vector,
             #[expect(deprecated)]
             type_codes::JSON_OBJ_CODE => ValueType::JSONObject,
             _ => {
@@ -538,6 +547,17 @@ where R: Read
             ValueType::PreTokStr => {
                 let val = self.deserialize_pre_tokenized_string()?;
                 visitor.visit_pre_tokenized_string(val)
+            }
+            ValueType::Vector => {
+                let len = VInt::deserialize(self.reader)?;
+                let n = len.val() as usize;
+                let mut out = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let f = <f32 as BinarySerializable>::deserialize(self.reader)
+                        .map_err(DeserializeError::from)?;
+                    out.push(f);
+                }
+                visitor.visit_vector(out)
             }
             ValueType::Array => {
                 let access =

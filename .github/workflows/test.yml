@@ -48,7 +48,8 @@ jobs:
       run: cargo +nightly fmt --all -- --check
 
     - name: Check Stable Compilation
-      run: cargo build --all-features
+      # `vector-simd` needs nightly `portable_simd`, so it is left to the nightly bench build.
+      run: cargo build --features "mmap,stopwords,lz4-compression,zstd-compression,columnar-zstd-compression,failpoints,unstable,quickwit,jitexpr,compare_hash_only,vector"
 
 
     - name: Check Bench Compilation
@@ -70,7 +71,7 @@ jobs:
     strategy:
       matrix:
         features:
-          - { label: "all", flags: "mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer,jitexpr" }
+          - { label: "all", flags: "mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer,jitexpr,vector" }
           - { label: "quickwit", flags: "mmap,quickwit,failpoints,jitexpr" }
           - { label: "none", flags: "" }
 

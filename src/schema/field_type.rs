@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use super::ip_options::IpAddrOptions;
+use super::vector_options::VectorOptions;
 use super::IntoIpv6Addr;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::custom_options::CustomOptions;
@@ -85,6 +86,8 @@ pub enum Type {
     ///
     /// [`CustomOptions`]: crate::schema::CustomOptions
     Custom = b'c',
+    /// Dense `f32` vector (`Vec<f32>` with fixed dimension).
+    Vector = b'v',
 }
 
 impl From<ColumnType> for Type {
@@ -102,7 +105,7 @@ impl From<ColumnType> for Type {
     }
 }
 
-const ALL_TYPES: [Type; 11] = [
+const ALL_TYPES: [Type; 12] = [
     Type::Str,
     Type::U64,
     Type::I64,
@@ -114,6 +117,7 @@ const ALL_TYPES: [Type; 11] = [
     Type::Json,
     Type::IpAddr,
     Type::Custom,
+    Type::Vector,
 ];
 
 impl Type {
@@ -155,6 +159,7 @@ impl Type {
             Type::Json => "Json",
             Type::IpAddr => "IpAddr",
             Type::Custom => "Custom",
+            Type::Vector => "Vector",
         }
     }
 
@@ -174,6 +179,7 @@ impl Type {
             b'j' => Some(Type::Json),
             b'p' => Some(Type::IpAddr),
             b'c' => Some(Type::Custom),
+            b'v' => Some(Type::Vector),
             _ => None,
         }
     }
@@ -214,6 +220,9 @@ pub enum FieldType {
     /// [`add_custom`](crate::TantivyDocument::add_custom) and consumed by a
     /// [`SegmentPlugin`](crate::SegmentPlugin).
     Custom(CustomOptions),
+    /// Dense vector field (HNSW index when `vector` feature is enabled).
+    #[serde(rename = "vector")]
+    Vector(VectorOptions),
 }
 
 impl FieldType {
@@ -231,6 +240,7 @@ impl FieldType {
             FieldType::JsonObject(_) => Type::Json,
             FieldType::IpAddr(_) => Type::IpAddr,
             FieldType::Custom(_) => Type::Custom,
+            FieldType::Vector(_) => Type::Vector,
         }
     }
 
@@ -264,6 +274,11 @@ impl FieldType {
         matches!(self, FieldType::Date(_))
     }
 
+    /// returns true if this is a dense vector field
+    pub fn is_vector(&self) -> bool {
+        matches!(self, FieldType::Vector(_))
+    }
+
     /// returns true if the field is indexed.
     pub fn is_indexed(&self) -> bool {
         match *self {
@@ -277,7 +292,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.is_indexed(),
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_indexed(),
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_indexed(),
-            FieldType::TieBreaker | FieldType::Custom(_) => false,
+            FieldType::TieBreaker | FieldType::Custom(_) | FieldType::Vector(_) => false,
         }
     }
 
@@ -292,6 +307,7 @@ impl FieldType {
             FieldType::JsonObject(json_object_options) => json_object_options
                 .get_text_indexing_options()
                 .map(|text_indexing| text_indexing.index_option()),
+            FieldType::Vector(_) => None,
             field_type => {
                 if field_type.is_indexed() {
                     Some(IndexRecordOption::Basic)
@@ -316,7 +332,7 @@ impl FieldType {
             FieldType::Facet(_) => true,
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_fast(),
             FieldType::TieBreaker => true,
-            FieldType::Custom(_) => false,
+            FieldType::Custom(_) | FieldType::Vector(_) => false,
         }
     }
 
@@ -336,7 +352,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.fieldnorms(),
             FieldType::JsonObject(ref _json_object_options) => false,
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.fieldnorms(),
-            FieldType::TieBreaker | FieldType::Custom(_) => false,
+            FieldType::TieBreaker | FieldType::Custom(_) | FieldType::Vector(_) => false,
         }
     }
 
@@ -388,7 +404,7 @@ impl FieldType {
                     None
                 }
             }
-            FieldType::TieBreaker | FieldType::Custom(_) => None,
+            FieldType::TieBreaker | FieldType::Custom(_) | FieldType::Vector(_) => None,
         }
     }
 
@@ -502,6 +518,10 @@ impl FieldType {
                     json: JsonValue::String(field_text),
                 }),
                 FieldType::Custom(_) => Err(custom_not_json_error(JsonValue::String(field_text))),
+                FieldType::Vector(_) => Err(ValueParsingError::TypeError {
+                    expected: "a json array of numbers",
+                    json: JsonValue::String(field_text),
+                }),
             },
             JsonValue::Number(field_val_num) => match self {
                 FieldType::I64(_) | FieldType::Date(_) => {
@@ -567,6 +587,10 @@ impl FieldType {
                 FieldType::Custom(_) => {
                     Err(custom_not_json_error(JsonValue::Number(field_val_num)))
                 }
+                FieldType::Vector(_) => Err(ValueParsingError::TypeError {
+                    expected: "a json array of numbers",
+                    json: JsonValue::Number(field_val_num),
+                }),
             },
             JsonValue::Object(json_map) => match self {
                 FieldType::Str(_) => {
@@ -621,10 +645,41 @@ impl FieldType {
                     json: JsonValue::Null,
                 }),
             },
-            _ => Err(ValueParsingError::TypeError {
-                expected: self.value_type().name(),
-                json: json.clone(),
-            }),
+            JsonValue::Array(arr) => match self {
+                FieldType::Vector(opts) => {
+                    if arr.len() != opts.dimension {
+                        return Err(ValueParsingError::TypeError {
+                            expected: "a json array with length matching field dimension",
+                            json: JsonValue::Array(arr),
+                        });
+                    }
+                    let mut vec = Vec::with_capacity(opts.dimension);
+                    for el in &arr {
+                        match el {
+                            JsonValue::Number(n) => {
+                                let Some(f) = n.as_f64() else {
+                                    return Err(ValueParsingError::TypeError {
+                                        expected: "a finite number",
+                                        json: JsonValue::Array(arr.clone()),
+                                    });
+                                };
+                                vec.push(f as f32);
+                            }
+                            _ => {
+                                return Err(ValueParsingError::TypeError {
+                                    expected: "numeric array elements",
+                                    json: JsonValue::Array(arr.clone()),
+                                });
+                            }
+                        }
+                    }
+                    Ok(OwnedValue::Vector(vec))
+                }
+                _ => Err(ValueParsingError::TypeError {
+                    expected: self.value_type().name(),
+                    json: JsonValue::Array(arr),
+                }),
+            },
         }
     }
 }

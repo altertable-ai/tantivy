@@ -59,11 +59,14 @@ fn load_metas(
 
 /// The built-in plugins, in write order.
 pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
-    vec![
+    let mut plugins: Vec<Arc<dyn SegmentPlugin>> = vec![
         Arc::new(InvertedIndexPlugin),
         Arc::new(FastFieldsPlugin),
         Arc::new(StorePlugin),
-    ]
+    ];
+    #[cfg(feature = "vector")]
+    plugins.push(Arc::new(crate::vector::VectorPlugin));
+    plugins
 }
 
 /// The files owned by the given segments: one per plugin extension (the built-in

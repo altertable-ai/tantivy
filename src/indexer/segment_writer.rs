@@ -2,7 +2,7 @@ use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
 use crate::fastfield::FastFieldsPluginWriter;
 use crate::index::{InvertedIndexPluginWriter, Segment};
-use crate::plugin::{PluginWriter, PluginWriterContext};
+use crate::plugin::{PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::schema::document::{Document, ErasedDocument};
 use crate::schema::Schema;
 use crate::store::StorePluginWriter;
@@ -34,6 +34,8 @@ pub struct SegmentWriter {
     pub(crate) fast_fields: FastFieldsPluginWriter,
     pub(crate) store_writer: StorePluginWriter,
     custom_plugins: Vec<Box<dyn PluginWriter>>,
+    #[cfg(feature = "vector")]
+    vector_writer: Box<dyn PluginWriter>,
     pub(crate) doc_opstamps: Vec<Opstamp>,
     schema: Schema,
 }
@@ -57,6 +59,8 @@ impl SegmentWriter {
         let inverted_index = InvertedIndexPluginWriter::new(&ctx)?;
         let fast_fields = FastFieldsPluginWriter::new(&ctx)?;
         let store_writer = StorePluginWriter::new(&ctx)?;
+        #[cfg(feature = "vector")]
+        let vector_writer = crate::vector::VectorPlugin.create_writer(&ctx)?;
         let custom_plugins = segment
             .index()
             .custom_plugins()
@@ -70,6 +74,8 @@ impl SegmentWriter {
             fast_fields,
             store_writer,
             custom_plugins,
+            #[cfg(feature = "vector")]
+            vector_writer,
             doc_opstamps: Vec::with_capacity(1_000),
             schema,
         })
@@ -149,6 +155,8 @@ impl SegmentWriter {
         Box::new(self.inverted_index).serialize(segment, mapping)?;
         Box::new(self.fast_fields).serialize(segment, mapping)?;
         Box::new(self.store_writer).serialize(segment, mapping)?;
+        #[cfg(feature = "vector")]
+        self.vector_writer.serialize(segment, mapping)?;
         for writer in self.custom_plugins {
             writer.serialize(segment, mapping)?;
         }
@@ -168,6 +176,16 @@ impl SegmentWriter {
                 .iter()
                 .map(|writer| writer.mem_usage())
                 .sum::<usize>()
+            + {
+                #[cfg(feature = "vector")]
+                {
+                    self.vector_writer.mem_usage()
+                }
+                #[cfg(not(feature = "vector"))]
+                {
+                    0
+                }
+            }
     }
 
     /// Indexes a new document
@@ -186,8 +204,19 @@ impl SegmentWriter {
         self.fast_fields.index_document(&document)?;
         self.store_writer.store(&document, &self.schema)?;
 
-        // Custom plugins are trait objects, so they take the document type-erased. Leaves stay
-        // borrowed; a plugin that knows the concrete type recovers it for free via `as_any`.
+        // The vector writer and custom plugins are trait objects, so they take the document
+        // type-erased. Leaves stay borrowed; a plugin that knows the concrete type recovers it
+        // for free via `as_any`.
+        #[cfg(feature = "vector")]
+        {
+            let erased: &dyn ErasedDocument = &document;
+            self.vector_writer
+                .add_document(doc_id, erased, &self.schema)?;
+            for writer in &mut self.custom_plugins {
+                writer.add_document(doc_id, erased, &self.schema)?;
+            }
+        }
+        #[cfg(not(feature = "vector"))]
         if !self.custom_plugins.is_empty() {
             let erased: &dyn ErasedDocument = &document;
             for writer in &mut self.custom_plugins {

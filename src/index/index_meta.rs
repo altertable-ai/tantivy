@@ -434,8 +434,11 @@ mod tests {
 
     fn expected_builtin_files(segment_id: SegmentId, delete_opstamp: u64) -> HashSet<PathBuf> {
         let segment_uuid = segment_id.uuid_string();
-        let mut files = HashSet::with_capacity(7);
-        for extension in ["idx", "pos", "term", "store", "fast", "fieldnorm"] {
+        let mut files = HashSet::with_capacity(8);
+        let mut extensions = vec!["idx", "pos", "term", "store", "fast", "fieldnorm"];
+        #[cfg(feature = "vector")]
+        extensions.push("vec");
+        for extension in extensions {
             files.insert(PathBuf::from(format!("{segment_uuid}.{extension}")));
         }
         files.insert(PathBuf::from(format!(
