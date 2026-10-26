@@ -17,6 +17,7 @@ use std::sync::Once;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use tantivy::collector::TopDocs;
+use tantivy::index::SegmentComponent;
 use tantivy::query::KnnQuery;
 use tantivy::schema::{Schema, VectorDistance, VectorOptions};
 use tantivy::{doc, ByteCount, Index, IndexWriter};
@@ -50,7 +51,15 @@ fn wiki_vector_vec_file_bytes() -> ByteCount {
     w.wait_merging_threads().unwrap();
     let reader = index.reader().unwrap();
     let usage = reader.searcher().space_usage().unwrap();
-    usage.segments().iter().map(|s| s.vector_index()).sum()
+    usage
+        .segments()
+        .iter()
+        .map(|segment| {
+            segment
+                .component(SegmentComponent::Custom("vec".to_string()))
+                .total()
+        })
+        .sum()
 }
 
 /// Must match [`wiki_embedded.meta.json`](wiki_embedded.meta.json) and `wiki_embedded.f32.bin`.
