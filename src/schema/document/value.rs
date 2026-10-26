@@ -96,6 +96,12 @@ pub trait Value<'a>: Send + Sync + Debug {
     }
 
     #[inline]
+    /// If the Value is a vector, returns the slice. Returns None otherwise.
+    fn as_vector(&self) -> Option<&'a [f32]> {
+        self.as_leaf().and_then(|leaf| leaf.as_vector())
+    }
+
+    #[inline]
     /// Returns the iterator over the array if the Value is an array.
     fn as_array(&self) -> Option<Self::ArrayIter> {
         if let ReferenceValue::Array(val) = self.as_value() {
@@ -145,6 +151,8 @@ pub enum ReferenceValueLeaf<'a> {
     /// Opaque payload of a plugin-defined custom field. Distinct from [`Bytes`](Self::Bytes) so
     /// the built-ins leave it alone and a consuming plugin can recognize it.
     Custom(&'a [u8]),
+    /// Dense `f32` embedding vector.
+    Vector(&'a [f32]),
 }
 
 impl From<u64> for ReferenceValueLeaf<'_> {
@@ -231,6 +239,9 @@ impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<
             }
             ReferenceValueLeaf::Custom(val) => {
                 ReferenceValue::Leaf(ReferenceValueLeaf::Custom(val))
+            }
+            ReferenceValueLeaf::Vector(val) => {
+                ReferenceValue::Leaf(ReferenceValueLeaf::Vector(val))
             }
         }
     }
@@ -348,6 +359,16 @@ impl<'a> ReferenceValueLeaf<'a> {
     /// If the Value is a custom payload, returns its bytes. Returns None otherwise.
     pub fn as_custom(&self) -> Option<&'a [u8]> {
         if let Self::Custom(val) = self {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    /// If the Value is a vector, returns the slice. Returns None otherwise.
+    pub fn as_vector(&self) -> Option<&'a [f32]> {
+        if let Self::Vector(val) = self {
             Some(val)
         } else {
             None

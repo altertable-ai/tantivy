@@ -230,6 +230,9 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
             ReferenceValueLeaf::Custom(_) => {
                 unimplemented!("the JSON field does not support custom field types")
             }
+            ReferenceValueLeaf::Vector(_) => {
+                unimplemented!("Vector support in dynamic JSON fields is not yet implemented")
+            }
         },
         ReferenceValue::Array(elements) => {
             for val in elements {

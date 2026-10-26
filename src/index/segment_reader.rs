@@ -18,6 +18,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
+use crate::vector::VectorFieldReaders;
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -50,6 +51,8 @@ pub struct SegmentReader {
     store_file: FileSlice,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
+
+    vector_readers: VectorFieldReaders,
 }
 
 impl SegmentReader {
@@ -98,6 +101,11 @@ impl SegmentReader {
     /// May panic if the index is corrupted.
     pub fn fast_fields(&self) -> &FastFieldReaders {
         &self.fast_fields_readers
+    }
+
+    /// Readers for dense vector fields (HNSW index) in this segment.
+    pub fn vector_readers(&self) -> &VectorFieldReaders {
+        &self.vector_readers
     }
 
     /// Accessor to the `FacetReader` associated with a given `Field`.
@@ -180,6 +188,15 @@ impl SegmentReader {
         let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
 
+        let vector_index_file = segment
+            .open_read(SegmentComponent::Custom("vec".to_string()))
+            .ok();
+        let vector_readers = if let Some(ref slice) = vector_index_file {
+            VectorFieldReaders::open(slice.clone())?
+        } else {
+            VectorFieldReaders::empty()
+        };
+
         let original_bitset = if segment.meta().has_deletes() {
             let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
             let alive_doc_data = alive_doc_file_slice.read_bytes()?;
@@ -211,6 +228,7 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite,
             schema,
+            vector_readers,
         })
     }
 

@@ -216,6 +216,9 @@ impl FastFieldsWriter {
                 ReferenceValueLeaf::Custom(_) => {
                     unreachable!("the fast field writer does not support custom field types")
                 }
+                ReferenceValueLeaf::Vector(_) => {
+                    // Vectors are not stored in the columnar fast-field format.
+                }
             },
             ReferenceValue::Array(val) => {
                 // TODO: Check this is the correct behaviour we want.
@@ -356,6 +359,9 @@ fn record_json_value_to_columnar_writer<'a, V: Value<'a>>(
             }
             ReferenceValueLeaf::Custom(_) => {
                 unimplemented!("the JSON field does not support custom field types")
+            }
+            ReferenceValueLeaf::Vector(_) => {
+                unimplemented!("Vector support in dynamic JSON fields is not yet implemented")
             }
         },
         ReferenceValue::Array(elements) => {

@@ -139,6 +139,14 @@ where W: Write
                 ReferenceValueLeaf::Custom(_) => Err(io::Error::other(
                     "the store does not support custom field types",
                 )),
+                ReferenceValueLeaf::Vector(slice) => {
+                    self.write_type_code(type_codes::VECTOR_CODE)?;
+                    VInt(slice.len() as u64).serialize(self.writer)?;
+                    for &f in slice {
+                        BinarySerializable::serialize(&f, self.writer)?;
+                    }
+                    Ok(())
+                }
             },
             ReferenceValue::Array(elements) => {
                 self.write_type_code(type_codes::ARRAY_CODE)?;

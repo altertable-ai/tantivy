@@ -51,6 +51,8 @@ pub enum OwnedValue {
     IpAddr(Ipv6Addr),
     /// Opaque payload of a plugin-defined custom field.
     Custom(Vec<u8>),
+    /// Dense embedding vector (`f32`), fixed dimension per field.
+    Vector(Vec<f32>),
 }
 
 impl AsRef<OwnedValue> for OwnedValue {
@@ -82,6 +84,7 @@ impl OwnedValue {
             OwnedValue::Object(_) => 11,
             OwnedValue::IpAddr(_) => 12,
             OwnedValue::Custom(_) => 13,
+            OwnedValue::Vector(_) => 14,
         }
     }
 }
@@ -104,6 +107,7 @@ impl<'a> Value<'a> for &'a OwnedValue {
             OwnedValue::Bytes(val) => ReferenceValueLeaf::Bytes(val).into(),
             OwnedValue::IpAddr(val) => ReferenceValueLeaf::IpAddr(*val).into(),
             OwnedValue::Custom(val) => ReferenceValueLeaf::Custom(val).into(),
+            OwnedValue::Vector(val) => ReferenceValueLeaf::Vector(val.as_slice()).into(),
             OwnedValue::Array(array) => ReferenceValue::Array(array.iter()),
             OwnedValue::Object(object) => ReferenceValue::Object(ObjectMapIter(object.iter())),
         }
@@ -163,6 +167,10 @@ impl ValueDeserialize for OwnedValue {
                 val: PreTokenizedString,
             ) -> Result<Self::Value, DeserializeError> {
                 Ok(OwnedValue::PreTokStr(val))
+            }
+
+            fn visit_vector(&self, val: Vec<f32>) -> Result<Self::Value, DeserializeError> {
+                Ok(OwnedValue::Vector(val))
             }
 
             fn visit_array<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
@@ -231,6 +239,7 @@ impl serde::Serialize for OwnedValue {
             // round-trip through serde (they are populated programmatically), so this is lossy
             // by design.
             OwnedValue::Custom(ref bytes) => serializer.serialize_str(&BASE64.encode(bytes)),
+            OwnedValue::Vector(ref v) => v.serialize(serializer),
         }
     }
 }
@@ -319,6 +328,7 @@ impl<'a, V: Value<'a>> From<ReferenceValue<'a, V>> for OwnedValue {
                 ReferenceValueLeaf::Bool(val) => OwnedValue::Bool(val),
                 ReferenceValueLeaf::PreTokStr(val) => OwnedValue::PreTokStr(*val.clone()),
                 ReferenceValueLeaf::Custom(val) => OwnedValue::Custom(val.to_vec()),
+                ReferenceValueLeaf::Vector(val) => OwnedValue::Vector(val.to_vec()),
             },
             ReferenceValue::Array(val) => {
                 OwnedValue::Array(val.map(|v| v.as_value().into()).collect())
